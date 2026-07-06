@@ -26,6 +26,8 @@ interface EventSummary {
   id: string;
   title?: string;
   date?: string;
+  teamSignup?: boolean;
+  fixedTeams?: boolean;
 }
 
 interface BrowserJoinDebug {
@@ -145,6 +147,10 @@ function fieldString(fields: Record<string, { stringValue?: string }> | undefine
   return fields?.[field]?.stringValue;
 }
 
+function fieldBool(fields: Record<string, { booleanValue?: boolean }> | undefined, field: string): boolean {
+  return fields?.[field]?.booleanValue === true;
+}
+
 async function queryGroupEvents(groupId: string, limit = 10): Promise<EventSummary[]> {
   const currentDateTime = getLisbonDateTimeString();
   const response = await fetch(
@@ -206,8 +212,26 @@ async function queryGroupEvents(groupId: string, limit = 10): Promise<EventSumma
         id: document.name.split("/").pop() || document.name,
         title: fieldString(document.fields, "title"),
         date: fieldString(document.fields, "date"),
+        teamSignup: fieldBool(document.fields, "teamSignup"),
+        fixedTeams: fieldBool(document.fields, "fixedTeams"),
       };
     });
+}
+
+// Team-signup / fixed-teams events need a partner in the Registration Checkout
+// ("Add partner..."), which the join flow does not handle — skip them. The
+// Firestore flags are the reliable signal; the title match is a fallback.
+const NON_JOINABLE_TITLE_PATTERN = /doubles/i;
+
+function isJoinableEvent(event: EventSummary): boolean {
+  if (event.teamSignup || event.fixedTeams) {
+    return false;
+  }
+  return !NON_JOINABLE_TITLE_PATTERN.test(event.title || "");
+}
+
+function pickJoinableEvent(events: EventSummary[]): EventSummary | undefined {
+  return events.find(isJoinableEvent);
 }
 
 async function checkGroupEvents(env: Env): Promise<CheckResult> {
@@ -756,16 +780,18 @@ async function joinFirstAvailableEvent(groupId: string, groupUrl: string, env: E
     .filter(Boolean);
   const expectedNames = uniqueStrings([displayName || "", ...configuredNames]);
   const events = await queryGroupEvents(groupId, 10);
+  const event = pickJoinableEvent(events);
 
-  if (!events.length) {
+  if (!event) {
     return {
       ok: false,
-      reason: "No upcoming events found.",
+      reason: events.length
+        ? "Only doubles events found; skipping (needs a partner)."
+        : "No upcoming events found.",
       events,
     };
   }
 
-  const event = events[0];
   const existingStatus = await getJoinStatus(event.id, auth);
 
   if (existingStatus.joined) {
@@ -1134,12 +1160,12 @@ async function notifyIfEventsAppeared(env: Env, result: CheckResult): Promise<vo
 async function autoJoinIfEventAppeared(env: Env): Promise<void> {
   const groupUrl = env.GROUP_URL || DEFAULT_GROUP_URL;
   const events = await queryGroupEvents(GROUP_ID, 10);
+  const event = pickJoinableEvent(events);
 
-  if (!events.length) {
+  if (!event) {
     return;
   }
 
-  const event = events[0];
   const stateKey = `${JOIN_STATE_PREFIX}${event.id}`;
   const state = await env.MONITOR_STATE.get(stateKey);
 
