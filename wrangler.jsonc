@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "racket-events-monitor",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-08",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "workers_dev": true,
+  "kv_namespaces": [
+    {
+      "binding": "MONITOR_STATE",
+      "id": "b8d946b698ab40329051246e0e90eebb"
+    }
+  ],
+  "browser": {
+    "binding": "BROWSER"
+  },
+  "alias": {
+    "debug": "./src/debug-stub.ts"
+  },
+  "vars": {
+    "GROUP_URL": "https://racket.id/groups/4Y4qCwClTWQPAM/"
+  },
+  "triggers": {
+    "crons": ["* 23 * * SUN", "* * * * MON"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}
