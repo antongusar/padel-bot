@@ -31,10 +31,6 @@
   "alias": {
     "debug": "./src/debug-stub.ts"
   },
-  "vars": {
-    "GROUP_ID": "4Y4qCwClTWQPAM",
-    "GROUP_URL": "https://racket.id/groups/4Y4qCwClTWQPAM/"
-  },
   "triggers": {
     "crons": ["* * * * *"]
   },
@@ -46,9 +42,7 @@
       "workers_dev": true,
       "vars": {
         "GROUP_ID": "IenuPng40UmpsU",
-        "GROUP_URL": "https://racket.id/groups/IenuPng40UmpsU",
-        "JOIN_DEBUG_SCREENSHOTS": "false",
-        "RACKET_PLAYER_NAMES": "Anton Gusar"
+        "JOIN_DEBUG_SCREENSHOTS": "false"
       },
       "kv_namespaces": [
         {

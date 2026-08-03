@@ -1,6 +1,6 @@
 # Racket Events Monitor
 
-Cloudflare Worker that checks a Racket ID group on Mondays and sends Telegram notifications when events appear.
+Cloudflare Worker that checks configured Racket ID groups on a runtime schedule, joins events, and sends Telegram notifications.
 
 The Worker uses the same Firestore query that the Racket group page uses for its activity list, so it does not spend Cloudflare Browser Run minutes for normal checks.
 
@@ -13,7 +13,17 @@ npm run deploy
 
 The cron fires every minute; the actual run window (which weekdays and what time,
 in Europe/Lisbon) is configured at runtime on the `/players` page and stored in KV
-(`schedule`). If no weekday is enabled, the Worker does nothing.
+(`schedule`). If `pausedUntil` is present, the page shows the pause deadline and
+affected groups, with a button that resumes monitoring immediately. If no weekday
+is enabled, the Worker does nothing.
+
+The same page stores `monitored_groups`, an ordered list of Racket group IDs and
+their enabled state. It accepts either IDs or full group URLs. A group can be
+disabled without deleting it; disabled groups are skipped by `/check` and the
+cron. The reset button beside a group clears the active event's Durable Object
+state, so the next cron can repeat a test registration for the same event ID.
+Environments without saved settings may provide `GROUP_ID` as an initial fallback;
+production uses the saved list only.
 
 ```jsonc
 "triggers": {
@@ -50,13 +60,15 @@ The Worker exposes `/telegram` as a Telegram webhook. When you send any message 
 KV is used only for small monitor state:
 
 - `telegram_chat_id`: where to send Telegram notifications.
-- `last_has_events`: previous event availability state, so the bot sends only on `false -> true`.
+- `last_has_events:<groupId>`: previous event availability for each group, so the bot sends only on `false -> true`.
+- `active_join_event:<groupId>`: event whose Durable Object state is current.
+- `monitored_groups`: ordered list of groups and their enabled state.
 
-The Worker reads `last_has_events` during scheduled checks, but writes it only when the state changes.
+The Worker reads each group's state during scheduled checks, but writes it only when the state changes.
 
 ## Auto Join
 
-When the Monday check finds an upcoming (non-doubles) event in the real group,
+When a scheduled check finds an upcoming (non-doubles) event in a monitored group,
 the Worker joins every enabled person from the roster (see `/players`) through
 Racket's authenticated Firestore API. Players are joined in the order shown on
 `/players`: the top enabled player is always attempted first.
@@ -78,6 +90,20 @@ browser fallback.
 The protected `/join-state?event=<eventId>` endpoint exposes the coordinator's
 read-only state for diagnostics.
 
+## Live Status
+
+The protected `/players` page includes an on-demand application status panel.
+It calls `GET /status` and shows the current Lisbon schedule state, live
+Firestore checks for every enabled group, the current event capacity, each
+enabled player's actual `registered` / `reserve` / `not_joined` status, and
+Browser Run limits plus recent sessions. Refreshing this panel does not launch
+a browser and does not write heartbeat or history records to KV.
+
+Cron checks and join batches also emit structured JSON logs with
+`type: "racket-monitor"`. Important actions include `cron_started`,
+`group_check_finished`, `cron_finished`, `cron_failed`, and
+`join_batch_finished`.
+
 Team-signup / "Doubles" events are skipped automatically (they need a partner in
 the Registration Checkout, which the join flow does not handle).
 
@@ -86,7 +112,8 @@ the Registration Checkout, which the join flow does not handle).
 Two endpoints trigger a real join:
 
 - `/join-test` — joins the first event of the test group (`IenuPng40UmpsU`).
-- `/join` — joins the first event of the real group (`GROUP_URL`).
+- `/join` — joins the first event of the first monitored group.
+- `/join?group=<groupId>` — manually selects a specific group.
 
 Both prefer the authenticated API and are protected by `JOIN_SECRET` (pass it
 as `x-join-secret` or `?secret=...`). The Cloudflare Browser Run binding named
@@ -122,8 +149,6 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN --env staging
 npm run deploy:staging
 ```
 
-Racket credentials must also be added to staging before a real `/join-test`
-smoke test. Production secrets are not inherited by Wrangler environments.
-
-The Racket credentials are stored as Cloudflare secrets named `RACKET_EMAIL` and
-`RACKET_PASSWORD`.
+The staging player and credentials are managed through the protected `/players`
+page and stored in the staging KV roster. Production secrets are not inherited
+by Wrangler environments.
