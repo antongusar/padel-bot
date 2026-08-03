@@ -11,15 +11,18 @@ npm install
 npm run deploy
 ```
 
-The schedule is configured in `wrangler.jsonc`. Cloudflare cron runs in UTC, so the Sunday 23:00 UTC trigger covers the first hour of Monday in Europe/Lisbon during daylight saving time; the code still skips checks unless it is Monday in Europe/Lisbon.
+The cron fires every minute; the actual run window (which weekdays and what time,
+in Europe/Lisbon) is configured at runtime on the `/players` page and stored in KV
+(`schedule`). If no weekday is enabled, the Worker does nothing.
 
 ```jsonc
 "triggers": {
-  "crons": ["* 23 * * SUN", "* * * * MON"]
+  "crons": ["* * * * *"]
 }
 ```
 
-Cloudflare cron expressions run in UTC. Cron trigger changes can take several minutes to propagate after deploy.
+Cron trigger changes can take several minutes to propagate after deploy. Each
+minute outside the window is a single KV read and an immediate return.
 
 ## Manual Check
 
@@ -53,31 +56,74 @@ The Worker reads `last_has_events` during scheduled checks, but writes it only w
 
 ## Auto Join
 
-When the Monday check finds an upcoming event in the real group, the Worker signs
-in with the configured Racket credentials and joins the first upcoming event
-through the Racket web UI.
+When the Monday check finds an upcoming (non-doubles) event in the real group,
+the Worker joins every enabled person from the roster (see `/players`) through
+Racket's authenticated Firestore API. Players are joined in the order shown on
+`/players`: the top enabled player is always attempted first.
+Use the up/down controls in the priority column to change that order, then save.
 
-Idempotency across the every-minute Monday cron is handled with a per-event KV
-flag (`join:<eventId>`): once joined it is marked `done` and no browser is
-launched again; on failure a counter caps retries at 10 so a persistent failure
-cannot burn browser minutes all day. Success and failure are reported to Telegram.
+One Durable Object is created per event id. It grants a renewable lease to only
+one cron/manual invocation, so competing every-minute ticks return immediately.
+Each successful player is checkpointed immediately
+before the next player starts. Retries receive only the remaining ids, and each
+person has an independent 10-attempt budget. The event is finalized (`done`) once
+all enabled people are joined. Success and failures are reported to Telegram.
 
-Registration is confirmed on the event page itself by finding the expected player
-name(s) in the joined-players list — set them as a comma-separated Cloudflare
-secret `RACKET_PLAYER_NAMES` exactly as Racket displays them (e.g. `Anton Gusar`).
-Matching is case-insensitive.
+The direct API path mirrors Racket's own registration transaction: it writes the
+player into the event's `users` or `reserves`, removes the invitation, and then
+verifies the result with an authenticated read. Paid, club, custom-field, and
+team registrations are deliberately excluded from this path and retain the
+browser fallback.
+
+The protected `/join-state?event=<eventId>` endpoint exposes the coordinator's
+read-only state for diagnostics.
+
+Team-signup / "Doubles" events are skipped automatically (they need a partner in
+the Registration Checkout, which the join flow does not handle).
 
 ## Manual Join
 
-Two endpoints trigger a join through the browser and stream step-by-step
-screenshots to the registered Telegram chat:
+Two endpoints trigger a real join:
 
 - `/join-test` — joins the first event of the test group (`IenuPng40UmpsU`).
 - `/join` — joins the first event of the real group (`GROUP_URL`).
 
-Both use the Cloudflare Browser Rendering binding named `BROWSER` and are protected
-by `JOIN_SECRET` (pass it as `x-join-secret` or `?secret=...`). Normal scheduled
-checks still use Firestore reads and do not launch a browser.
+Both prefer the authenticated API and are protected by `JOIN_SECRET` (pass it
+as `x-join-secret` or `?secret=...`). The Cloudflare Browser Run binding named
+`BROWSER` is used only as a fallback for registration types that the direct API
+path intentionally does not support.
+
+Fallback browser joins do not send step-by-step screenshots by default. Set the optional Worker variable
+`JOIN_DEBUG_SCREENSHOTS=true` to enable them. Manual `/join` and `/join-test`
+requests always keep debug screenshots enabled.
+
+## Tests
+
+```sh
+npm test
+```
+
+The Cloudflare Workers Vitest suite runs inside `workerd` with real Durable
+Object bindings. It simulates a sudden event release, twenty concurrent cron
+ticks, partial success, lease recovery after a crash, and per-person retry
+exhaustion. It also validates direct API patches for normal and reserve joins.
+
+## Staging
+
+`wrangler.jsonc` contains an isolated `staging` environment. It targets the test
+group, has no cron trigger, and provisions separate KV and Durable Object
+storage. The deployed staging URL is
+`https://racket-events-monitor-staging.anton-gusar.workers.dev`.
+Configure staging-specific secrets separately:
+
+```sh
+npx wrangler secret put JOIN_SECRET --env staging
+npx wrangler secret put TELEGRAM_BOT_TOKEN --env staging
+npm run deploy:staging
+```
+
+Racket credentials must also be added to staging before a real `/join-test`
+smoke test. Production secrets are not inherited by Wrangler environments.
 
 The Racket credentials are stored as Cloudflare secrets named `RACKET_EMAIL` and
 `RACKET_PASSWORD`.

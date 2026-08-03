@@ -14,16 +14,67 @@
   "browser": {
     "binding": "BROWSER"
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "JOIN_COORDINATOR",
+        "class_name": "JoinCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["JoinCoordinator"]
+    }
+  ],
   "alias": {
     "debug": "./src/debug-stub.ts"
   },
   "vars": {
+    "GROUP_ID": "4Y4qCwClTWQPAM",
     "GROUP_URL": "https://racket.id/groups/4Y4qCwClTWQPAM/"
   },
   "triggers": {
-    "crons": ["* 23 * * SUN", "* * * * MON"]
+    "crons": ["* * * * *"]
   },
   "observability": {
     "enabled": true
+  },
+  "env": {
+    "staging": {
+      "workers_dev": true,
+      "vars": {
+        "GROUP_ID": "IenuPng40UmpsU",
+        "GROUP_URL": "https://racket.id/groups/IenuPng40UmpsU",
+        "JOIN_DEBUG_SCREENSHOTS": "false",
+        "RACKET_PLAYER_NAMES": "Anton Gusar"
+      },
+      "kv_namespaces": [
+        {
+          "binding": "MONITOR_STATE"
+        }
+      ],
+      "browser": {
+        "binding": "BROWSER"
+      },
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "JOIN_COORDINATOR",
+            "class_name": "JoinCoordinator"
+          }
+        ]
+      },
+      "migrations": [
+        {
+          "tag": "v1",
+          "new_sqlite_classes": ["JoinCoordinator"]
+        }
+      ],
+      "triggers": {
+        "crons": []
+      }
+    }
   }
 }

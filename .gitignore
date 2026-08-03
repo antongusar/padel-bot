@@ -2,3 +2,5 @@ node_modules/
 .wrangler/
 dist/
 .DS_Store
+.dev.vars
+.claude/launch.json
