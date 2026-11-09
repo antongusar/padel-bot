@@ -53,6 +53,11 @@
   "observability": {
     "enabled": true
   },
+  // A join run makes one fetch per Racket/Firestore call; the implicit cap of
+  // 50 per invocation was hit on 2026-11-09 while joining a second doubles team.
+  "limits": {
+    "subrequests": 1000
+  },
   "env": {
     "staging": {
       "workers_dev": true,
@@ -98,6 +103,9 @@
           "new_sqlite_classes": ["MonitorScheduler"]
         }
       ],
+      "limits": {
+        "subrequests": 1000
+      },
       "triggers": {
         "crons": ["* * * * *"]
       }
