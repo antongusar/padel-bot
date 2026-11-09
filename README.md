@@ -12,11 +12,13 @@ npm run deploy
 ```
 
 The cron fires every minute as a watchdog. During the configured run window it
-starts a singleton `MonitorScheduler` Durable Object, which searches for new
-events once every 60 seconds. Between searches, only discovered events still
-waiting for participants or retrying registration are read directly by ID every
-10 seconds. Completed or exhausted events leave the fast queue; discovery keeps
-running every minute so later events can still be found. The queue, known copy
+starts a singleton `MonitorScheduler` Durable Object that ticks every 10 seconds.
+Each tick runs one cheap group query per monitored group; an enabled event that is
+not yet known triggers full discovery in the same tick. Full discovery (group
+query plus `copiedFrom` copy search) also runs once every 60 seconds. Discovered
+events still waiting for participants or retrying registration are read directly
+by ID every 10 seconds. Completed or exhausted events leave the fast queue.
+Idle ticks also renew players' Racket sessions before they expire. The queue, known copy
 parents, and last discovery time survive scheduler restarts in Durable Object storage.
 The weekdays and times use Europe/Lisbon and
 are configured at runtime on `/players` in KV (`schedule`). If `pausedUntil` is
@@ -74,6 +76,10 @@ KV is used only for small monitor state:
 - `last_has_events:<groupId>`: compact event ID and auto-join eligibility signature, so the bot writes and sends only when the event set changes.
 - `active_join_event:<groupId>`: event whose Durable Object state is current.
 - `monitored_groups`: ordered list of groups and their enabled state.
+- `racket_auth:<personId>`: cached Firebase session (ID and refresh token) of a
+  roster player, bound to a hash of their credentials.
+- `racket_auth_backoff:<personId>`: present for 30 minutes after a failed
+  background login, so warm-up and discovery do not retry a wrong password.
 
 The Worker reads each group's state during scheduled checks, but writes it only when the state changes.
 
@@ -93,7 +99,11 @@ Copies must have the same creator as their known parent, be event products with
 creator-only events, bookings, and copies attached to another group are excluded.
 Parent IDs are remembered even after removal from the group; successive copies
 are followed in the same discovery pass. Queries project only event metadata
-and batch up to 30 parent IDs per request, once per minute.
+and batch up to 30 parent IDs per request, once per minute. Firestore rules
+reject anonymous `copiedFrom` queries (403), so discovery signs in as the first
+enabled roster player, falling back to the next one if that login fails.
+The protected `/discovery-preview?group=<id>` endpoint runs the same discovery
+read-only and lists the candidates with their current group and participant count.
 Undated candidates created within the last seven days are persisted and read
 every 10 seconds. Older permanent templates remain copy parents and are checked
 by minute discovery rather than occupying the fast queue. Undated candidates are never joined
@@ -108,6 +118,12 @@ Racket's authenticated Firestore API. Players are joined in the order shown on
 `/players`: the top enabled player is always attempted first.
 Use the up/down controls in the priority column to change that order, then save.
 
+Players' sessions come from the KV cache, so a join normally spends no
+requests on logins; all accounts needed for a batch are prepared in parallel
+before the first write. Several events found in one check are joined
+concurrently. The new-events Telegram message is sent alongside registration
+rather than before it.
+
 One Durable Object is created per event id. It grants a renewable lease to only
 one alarm/manual invocation, so competing ticks return immediately.
 Each successful player is checkpointed immediately
@@ -117,7 +133,9 @@ all enabled people are joined. Success and failures are reported to Telegram.
 
 The direct API path mirrors Racket's own registration transaction: it writes the
 player into the event's `users` or `reserves`, removes the invitation, and then
-verifies the result with an authenticated read. Paid, club, custom-field, and
+verifies the result from the document returned by the write (falling back to an
+authenticated read). Optimistic-write conflicts (409, 412, or 400
+`FAILED_PRECONDITION`) are re-read and retried immediately, up to five times. Paid, club, custom-field, and
 team registrations are deliberately excluded from this path and retain the
 browser fallback.
 

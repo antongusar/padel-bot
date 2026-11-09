@@ -13,12 +13,17 @@ const QUERY_FIELDS = [
   "doubles", "teamSignup", "fixedTeams",
 ];
 
-async function queryProducts(field: "group" | "copiedFrom", values: string[]) {
+// Firestore rules allow anonymous list queries only when they filter by group.
+// A copiedFrom query must be authenticated, or it fails with 403.
+async function queryProducts(field: "group" | "copiedFrom", values: string[], idToken?: string) {
   const response = await fetch(
     `https://firestore.googleapis.com/v1/projects/racket-id/databases/(default)/documents:runQuery?key=${FIRESTORE_API_KEY}`,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...idToken ? { authorization: `Bearer ${idToken}` } : {},
+      },
       body: JSON.stringify({
         structuredQuery: {
           from: [{ collectionId: "IProducts" }],
@@ -82,6 +87,7 @@ export async function discoverEventCopies(
   groupId: string,
   storedSeeds: CopySeed[],
   now: string,
+  idToken?: string,
 ) {
   const seeds = new Map(storedSeeds.map((seed) => [seed.id, seed]));
   const candidates = new Map<string, EventSummary>();
@@ -92,7 +98,7 @@ export async function discoverEventCopies(
   };
   // All past group events are valid parents. In particular, keep parents even
   // after they expire or disappear from the group, across scheduler restarts.
-  for (const document of await queryProducts("group", [groupId])) {
+  for (const document of await queryProducts("group", [groupId], idToken)) {
     if (field(document, "group") === groupId && field(document, "type") === "event" &&
         field(document, "status") === "instance") remember(document);
   }
@@ -104,7 +110,7 @@ export async function discoverEventCopies(
     const parents = frontier.splice(0, 30);
     for (const parent of parents) visited.add(parent);
     const parentSet = new Set(parents);
-    const documents = await queryProducts("copiedFrom", parents);
+    const documents = await queryProducts("copiedFrom", parents, idToken);
     copyQueryCount++;
     for (const document of documents) {
       const parentId = field(document, "copiedFrom");

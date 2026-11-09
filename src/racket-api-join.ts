@@ -36,6 +36,9 @@ export interface ApiJoinResult {
   alreadyJoined?: boolean;
   partnerUserId?: string;
   reason?: string;
+  // The document returned by a successful PATCH, used to verify the write
+  // without spending another read.
+  document?: FirestoreDocument;
 }
 
 export type ApiJoinAttemptOutcome =
@@ -332,13 +335,23 @@ async function getProduct(
   };
 }
 
+// Several concurrent writers are expected while an event fills up. Firestore
+// reports a stale currentDocument.updateTime as 409/412, and sometimes as
+// 400 FAILED_PRECONDITION; all of them mean "re-read and try again".
+const MAX_WRITE_ATTEMPTS = 5;
+
+export function isWriteConflict(status: number, body: string): boolean {
+  return status === 409 || status === 412 ||
+    (status === 400 && /FAILED_PRECONDITION/.test(body));
+}
+
 export async function joinEventViaApi(
   eventId: string,
   auth: { idToken: string; racketUserId: string },
   joinDate: string,
   onAttempt?: (telemetry: ApiJoinAttemptTelemetry) => void,
 ): Promise<ApiJoinResult> {
-  for (let attemptIndex = 0; attemptIndex < 3; attemptIndex += 1) {
+  for (let attemptIndex = 0; attemptIndex < MAX_WRITE_ATTEMPTS; attemptIndex += 1) {
     const attempt = attemptIndex + 1;
     const attemptStartedAt = Date.now();
     const read = await getProduct(eventId, auth.idToken);
@@ -461,9 +474,15 @@ export async function joinEventViaApi(
         totalDurationMs: Date.now() - attemptStartedAt,
         responseUpdateTime: responseDocument?.updateTime,
       });
-      return { ok: true, supported: true, status: patch.status };
+      return {
+        ok: true,
+        supported: true,
+        status: patch.status,
+        document: responseDocument ?? undefined,
+      };
     }
-    if (response.status === 409 || response.status === 412) {
+    const errorText = await response.text();
+    if (isWriteConflict(response.status, errorText)) {
       onAttempt?.({
         attempt,
         outcome: "write_conflict",
@@ -477,7 +496,7 @@ export async function joinEventViaApi(
       continue;
     }
 
-    const reason = `Firestore API join write failed: ${response.status} ${await response.text()}`;
+    const reason = `Firestore API join write failed: ${response.status} ${errorText}`;
     onAttempt?.({
       attempt,
       outcome: "write_failed",
@@ -573,7 +592,7 @@ export async function joinTeamEventViaApi(
   let resolvedPartnerUserId = partnerUserId || createTemporaryUserId();
   let placeholderCreated = Boolean(partnerUserId);
 
-  for (let attemptIndex = 0; attemptIndex < 3; attemptIndex += 1) {
+  for (let attemptIndex = 0; attemptIndex < MAX_WRITE_ATTEMPTS; attemptIndex += 1) {
     const attempt = attemptIndex + 1;
     const attemptStartedAt = Date.now();
     const read = await getProduct(eventId, auth.idToken);
@@ -710,9 +729,11 @@ export async function joinTeamEventViaApi(
         supported: true,
         status: patch.status,
         partnerUserId: resolvedPartnerUserId,
+        document: responseDocument ?? undefined,
       };
     }
-    if (response.status === 409 || response.status === 412) {
+    const errorText = await response.text();
+    if (isWriteConflict(response.status, errorText)) {
       onAttempt?.({
         attempt,
         outcome: "write_conflict",
@@ -726,7 +747,7 @@ export async function joinTeamEventViaApi(
       continue;
     }
 
-    const reason = `Firestore team join write failed: ${response.status} ${await response.text()}`;
+    const reason = `Firestore team join write failed: ${response.status} ${errorText}`;
     onAttempt?.({
       attempt,
       outcome: "write_failed",

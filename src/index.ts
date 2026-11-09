@@ -24,6 +24,12 @@ import {
 import { joinEventViaApi, joinTeamEventViaApi } from "./racket-api-join";
 import { discoverEventCopies, isRecentUndatedEvent, type CopySeedsByGroup } from "./event-copy-discovery";
 import {
+  kvRacketAuthStore,
+  RacketAuthProvider,
+  type RacketAuthSource,
+  type RefreshedToken,
+} from "./racket-auth-cache";
+import {
   OperationLogStoreClient,
   type OperationLogLevel,
   type OperationLogView,
@@ -89,6 +95,8 @@ interface FirebaseAuthResult {
   idToken: string;
   localId: string;
   racketUserId: string;
+  refreshToken?: string;
+  expiresIn?: string;
 }
 
 interface RacketCallableEnvelope<T> {
@@ -156,6 +164,14 @@ const MONITOR_PENDING_EVENTS_KEY = "pending-events";
 const MONITOR_COPY_SEEDS_KEY = "copy-seeds";
 const MONITOR_LAST_DISCOVERY_KEY = "last-discovery-at";
 const MONITOR_ROUTINE_LOG_MINUTE_KEY = "routine-log-minute";
+// Sessions are refreshed in idle ticks well before they expire, so a join run
+// normally starts with cached tokens and spends no requests on logins.
+const AUTH_WARM_VALIDITY_MS = 15 * 60_000;
+const AUTH_WARM_MAX_PER_TICK = 2;
+// Background logins (warm-up, discovery) that fail are paused for this long so
+// a wrong password is not retried every few seconds. Joins ignore the pause.
+const AUTH_BACKOFF_KEY_PREFIX = "racket_auth_backoff:";
+const AUTH_BACKOFF_TTL_S = 30 * 60;
 
 type JoinOutcome = { ok: boolean; reason?: string };
 
@@ -840,6 +856,73 @@ async function signInToRacket(
 
   const firebase = (await response.json()) as Omit<FirebaseAuthResult, "racketUserId">;
   return { ...firebase, racketUserId: userIds[0] };
+}
+
+async function refreshRacketToken(refreshToken: string): Promise<RefreshedToken> {
+  const response = await fetch(
+    `https://securetoken.googleapis.com/v1/token?key=${FIRESTORE_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`Firebase token refresh failed: ${response.status} ${await response.text()}`);
+  }
+  const body = await response.json<{
+    id_token?: string;
+    refresh_token?: string;
+    expires_in?: string;
+    user_id?: string;
+  }>();
+  if (!body.id_token) throw new Error("Firebase token refresh returned no id_token.");
+  return {
+    idToken: body.id_token,
+    refreshToken: body.refresh_token || refreshToken,
+    expiresIn: body.expires_in || "3600",
+    localId: body.user_id,
+  };
+}
+
+// Create one provider per invocation; see RacketAuthProvider.
+function createRacketAuthProvider(env: Env): RacketAuthProvider {
+  return new RacketAuthProvider(
+    kvRacketAuthStore(env.MONITOR_STATE),
+    signInToRacket,
+    refreshRacketToken,
+  );
+}
+
+// A cached token may be revoked (for example after a password change). Drop it
+// only when Firebase rejects the token itself; a 403 with a valid token is a
+// rules decision that a new login would not change.
+function isAuthFailure(reason: string): boolean {
+  return /\b401\b|UNAUTHENTICATED|TOKEN_EXPIRED|INVALID_ID_TOKEN/i.test(reason);
+}
+
+function participationFromDocument(
+  document: { fields?: Record<string, {
+    mapValue?: { fields?: Record<string, unknown> };
+    arrayValue?: { values?: { stringValue?: string }[] };
+  }> } | undefined,
+  userId: string,
+  partnerUserId?: string,
+): { joined: boolean; status: ParticipationStatus } | null {
+  if (!document?.fields) return null;
+  const users = Object.keys(document.fields.users?.mapValue?.fields || {});
+  const reserves = (document.fields.reserves?.arrayValue?.values || [])
+    .map((value) => value.stringValue || "")
+    .filter(Boolean);
+  const leaderStatus = findFirestoreParticipation(users, reserves, userId);
+  if (!partnerUserId) return { joined: leaderStatus !== "not_joined", status: leaderStatus };
+  const partnerStatus = findFirestoreParticipation(users, reserves, partnerUserId);
+  return leaderStatus !== "not_joined" && leaderStatus === partnerStatus
+    ? { joined: true, status: leaderStatus }
+    : { joined: false, status: "not_joined" };
 }
 
 async function getFirestoreDocument(path: string, idToken?: string): Promise<FirestoreDocument> {
@@ -1527,10 +1610,11 @@ async function getApplicationStatus(env: Env, log: OperationalLogger) {
   >();
 
   if (joinableEvents.length) {
+    const authProvider = createRacketAuthProvider(env);
     await Promise.all(
       enabledPeople.map(async (person) => {
         try {
-          const auth = await signInToRacket(person.email, person.password);
+          const { auth } = await authProvider.get(person);
           authByPerson.set(person.id, { racketUserId: auth.racketUserId });
         } catch (error) {
           authByPerson.set(person.id, {
@@ -1946,6 +2030,7 @@ async function joinFirstAvailableEvent(
   log: OperationalLogger = consoleOperationalLog,
   selectedEvent?: EventSummary,
   groupConfig?: MonitoredGroup,
+  authProvider: RacketAuthProvider = createRacketAuthProvider(env),
 ) {
   const events = selectedEvent ? [selectedEvent] : await queryGroupEvents(groupId, 10);
   const event = selectedEvent || pickJoinableEvent(events, groupConfig);
@@ -1992,6 +2077,31 @@ async function joinFirstAvailableEvent(
         throw new Error("BROWSER binding is not configured.");
       }
       debugChatId = debug ? await env.MONITOR_STATE.get(TELEGRAM_CHAT_ID_KEY) : null;
+      // Authenticate everyone up front and in parallel; the sequential writes
+      // below then start immediately one after another.
+      const preparedStartedAt = Date.now();
+      const credentials = new Map<string, Person>();
+      for (const candidate of people) {
+        credentials.set(candidate.leader.id, candidate.leader);
+        if (candidate.partner) credentials.set(candidate.partner.id, candidate.partner);
+      }
+      const prepared = await Promise.allSettled(
+        Array.from(credentials.values()).map((credential) => authProvider.get(credential)),
+      );
+      const sources: Partial<Record<RacketAuthSource, number>> = {};
+      for (const lease of prepared) {
+        if (lease.status === "fulfilled") {
+          sources[lease.value.source] = (sources[lease.value.source] || 0) + 1;
+        }
+      }
+      log("racket_auth_prepared", {
+        groupId,
+        eventId: event.id,
+        accountCount: credentials.size,
+        sources,
+        failedCount: prepared.filter((lease) => lease.status === "rejected").length,
+        durationMs: Date.now() - preparedStartedAt,
+      });
     },
     joinPerson: async (person, heartbeat) => {
       const personStartedAt = Date.now();
@@ -2004,6 +2114,7 @@ async function joinFirstAvailableEvent(
       let auth: FirebaseAuthResult | null = null;
       let fallbackReason = "API path did not complete.";
       let apiPhase = "authentication";
+      const leader = person.leader;
       try {
         const authStartedAt = Date.now();
         log("racket_auth_started", {
@@ -2012,57 +2123,19 @@ async function joinFirstAvailableEvent(
           personId: person.id,
           name: person.name,
         });
-        auth = await signInToRacket(person.email, person.password);
+        const lease = await authProvider.get(leader);
+        auth = lease.auth;
         log("racket_auth_finished", {
           groupId,
           eventId: event.id,
           personId: person.id,
           name: person.name,
+          source: lease.source,
           durationMs: Date.now() - authStartedAt,
         });
 
-        apiPhase = "participation_precheck";
-        const precheckStartedAt = Date.now();
-        log("participation_precheck_started", {
-          groupId,
-          eventId: event.id,
-          personId: person.id,
-          name: person.name,
-        });
-        const status = await getJoinStatus(event.id, auth);
-        log("participation_precheck_finished", {
-          groupId,
-          eventId: event.id,
-          personId: person.id,
-          name: person.name,
-          joined: status.joined,
-          status: status.status,
-          durationMs: Date.now() - precheckStartedAt,
-        });
-        if (status.joined) {
-          const result: PersonJoinResult = {
-            id: person.id,
-            name: person.name,
-            email: person.email,
-            ok: true,
-            verified: true,
-            verifiedVia: `firestore:${status.status}`,
-            alreadyJoined: true,
-            status: status.status,
-          };
-          log("join_person_finished", {
-            groupId,
-            eventId: event.id,
-            personId: person.id,
-            name: person.name,
-            route: "firestore_precheck",
-            status: result.status,
-            alreadyJoined: true,
-            durationMs: Date.now() - personStartedAt,
-          });
-          return result;
-        }
-
+        // No separate participation pre-read: the join call reads the event
+        // anyway and reports an existing registration as alreadyJoined.
         apiPhase = "firestore_join";
         let partnerAuth: FirebaseAuthResult | null = null;
         if (isDoublesEvent(event) && person.partner) {
@@ -2074,16 +2147,15 @@ async function joinFirstAvailableEvent(
             partnerId: person.partner.id,
             partnerName: person.partner.name,
           });
-          partnerAuth = await signInToRacket(
-            person.partner.email,
-            person.partner.password,
-          );
+          const partnerLease = await authProvider.get(person.partner);
+          partnerAuth = partnerLease.auth;
           log("racket_partner_auth_finished", {
             groupId,
             eventId: event.id,
             teamId: person.doublesTeamId,
             partnerId: person.partner.id,
             partnerName: person.partner.name,
+            source: partnerLease.source,
             durationMs: Date.now() - partnerAuthStartedAt,
           });
         }
@@ -2133,6 +2205,29 @@ async function joinFirstAvailableEvent(
               : "warn",
           ),
             );
+        if (apiJoin.ok && apiJoin.alreadyJoined && apiJoin.status) {
+          const result: PersonJoinResult = {
+            id: person.id,
+            name: person.name,
+            email: person.email,
+            ok: true,
+            verified: true,
+            verifiedVia: `firestore:${apiJoin.status}`,
+            alreadyJoined: true,
+            status: apiJoin.status,
+          };
+          log("join_person_finished", {
+            groupId,
+            eventId: event.id,
+            personId: person.id,
+            name: person.name,
+            route: "firestore_precheck",
+            status: result.status,
+            alreadyJoined: true,
+            durationMs: Date.now() - personStartedAt,
+          });
+          return result;
+        }
         if (apiJoin.ok) {
           apiPhase = "participation_verification";
           const verificationStartedAt = Date.now();
@@ -2142,13 +2237,18 @@ async function joinFirstAvailableEvent(
             personId: person.id,
             name: person.name,
           });
-          const verified = isDoublesEvent(event) && apiJoin.partnerUserId
-            ? await getTeamJoinStatus(
-                event.id,
-                auth.racketUserId,
-                apiJoin.partnerUserId,
-              )
-            : await getJoinStatus(event.id, auth);
+          const teamPartnerId = isDoublesEvent(event) ? apiJoin.partnerUserId : undefined;
+          const fromWrite = participationFromDocument(
+            apiJoin.document,
+            auth.racketUserId,
+            teamPartnerId,
+          );
+          const verificationSource = fromWrite?.joined ? "write_response" : "read";
+          const verified = fromWrite?.joined
+            ? fromWrite
+            : teamPartnerId
+              ? await getTeamJoinStatus(event.id, auth.racketUserId, teamPartnerId)
+              : await getJoinStatus(event.id, auth);
           log("participation_verification_finished", {
             groupId,
             eventId: event.id,
@@ -2156,6 +2256,7 @@ async function joinFirstAvailableEvent(
             name: person.name,
             joined: verified.joined,
             status: verified.status,
+            source: verificationSource,
             durationMs: Date.now() - verificationStartedAt,
           }, verified.joined ? "info" : "warn");
           if (verified.joined) {
@@ -2188,6 +2289,7 @@ async function joinFirstAvailableEvent(
           );
         } else {
           fallbackReason = apiJoin.reason || "Firestore API returned an unknown failure.";
+          if (isAuthFailure(fallbackReason)) await authProvider.invalidate(leader.id);
           console.warn(
             `Racket API join unavailable for ${person.name || person.email}: ${apiJoin.reason || "unknown error"}; falling back to browser.`,
           );
@@ -2219,6 +2321,10 @@ async function joinFirstAvailableEvent(
         }
       } catch (error) {
         fallbackReason = error instanceof Error ? error.message : String(error);
+        if (isAuthFailure(fallbackReason)) {
+          await authProvider.invalidate(leader.id);
+          if (person.partner) await authProvider.invalidate(person.partner.id);
+        }
         log("api_path_failed", {
           groupId,
           eventId: event.id,
@@ -3018,6 +3124,7 @@ function logRunTitle(entries) {
   if (trigger === "cron") return "Плановая проверка";
   if (trigger === "alarm-10s") return "Быстрая проверка (10 секунд)";
   if (trigger === "discovery-minute") return "Поиск новых событий (раз в минуту)";
+  if (trigger === "group-probe") return "Новое событие в группе (проверка каждые 10 секунд)";
   if (trigger === "cron-watchdog") return "Контрольная проверка";
   if (trigger === "/status") return "Обновление состояния";
   if (trigger === "/join-test") return "Тестовая запись";
@@ -3949,6 +4056,7 @@ async function autoJoinEvent(
   detectedEvent: EventSummary,
   groupConfig: MonitoredGroup,
   log: OperationalLogger,
+  authProvider: RacketAuthProvider,
 ): Promise<AutoJoinStatus> {
   const people = buildJoinCandidates(
     await getRoster(env),
@@ -4022,6 +4130,7 @@ async function autoJoinEvent(
       log,
       detectedEvent,
       groupConfig,
+      authProvider,
     );
   } catch (error) {
     console.error("Auto-join coordinator failed:", error);
@@ -4115,6 +4224,7 @@ async function autoJoinIfEventAppeared(
   log: OperationalLogger,
   onEventStatus?: (event: EventSummary, status: AutoJoinStatus) => void,
   preserveKnownEvents = false,
+  authProvider: RacketAuthProvider = createRacketAuthProvider(env),
 ): Promise<AutoJoinStatus> {
   const events = detectedEvents.filter((event) =>
     isEventEnabledForGroup(event, groupConfig)
@@ -4137,8 +4247,9 @@ async function autoJoinIfEventAppeared(
       : events.map((event) => event.id),
   );
 
-  const statuses: AutoJoinStatus[] = [];
-  for (const event of events) {
+  // Events are separate Firestore documents with separate coordinators, so
+  // they are joined concurrently: a second event must not wait for the first.
+  const statuses = await Promise.all(events.map(async (event) => {
     const status = await autoJoinEvent(
       env,
       targetGroupId,
@@ -4146,10 +4257,11 @@ async function autoJoinIfEventAppeared(
       event,
       groupConfig,
       log,
+      authProvider,
     );
-    statuses.push(status);
     onEventStatus?.(event, status);
-  }
+    return status;
+  }));
   if (statuses.includes("retry")) return "retry";
   return statuses.every((status) => status === "complete") ? "complete" : "terminal";
 }
@@ -4168,6 +4280,52 @@ interface MonitorCheckOutcome {
 }
 
 const noopOperationalLogger: OperationalLogger = () => undefined;
+
+async function isBackgroundAuthPaused(env: Env, personId: string): Promise<boolean> {
+  return await env.MONITOR_STATE.get(`${AUTH_BACKOFF_KEY_PREFIX}${personId}`) !== null;
+}
+
+async function pauseBackgroundAuth(env: Env, personId: string): Promise<void> {
+  await env.MONITOR_STATE.put(`${AUTH_BACKOFF_KEY_PREFIX}${personId}`, new Date().toISOString(), {
+    expirationTtl: AUTH_BACKOFF_TTL_S,
+  }).catch((error) => console.warn(`Could not pause background auth for ${personId}:`, error));
+}
+
+// Copy discovery queries by copiedFrom, which Firestore only allows for signed-in
+// users. Players are tried in roster order; one whose login fails is paused and
+// the next one is used.
+async function getDiscoveryAuth(env: Env, authProvider: RacketAuthProvider): Promise<{
+  personId?: string;
+  personName?: string;
+  idToken?: string;
+  source?: RacketAuthSource;
+  error?: string;
+}> {
+  const people = await getPeopleToJoin(env);
+  if (!people.length) return { error: "No enabled player with credentials in the roster." };
+  const errors: string[] = [];
+  for (const person of people) {
+    if (errors.length >= 2) break;
+    if (await isBackgroundAuthPaused(env, person.id)) continue;
+    try {
+      const lease = await authProvider.get(person);
+      return {
+        personId: person.id,
+        personName: person.name,
+        idToken: lease.auth.idToken,
+        source: lease.source,
+      };
+    } catch (error) {
+      await pauseBackgroundAuth(env, person.id);
+      errors.push(`${person.name || person.id}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return {
+    error: errors.length
+      ? errors.join("; ")
+      : "Every player's background login is paused after recent failures.",
+  };
+}
 
 async function executeMonitorCheck(
   env: Env,
@@ -4215,12 +4373,20 @@ async function executeMonitorCheck(
           error: error instanceof Error ? error.message : String(error) };
       }
     }));
+  const authProvider = createRacketAuthProvider(env);
+  let discoveryAuth: Awaited<ReturnType<typeof getDiscoveryAuth>> | undefined;
+  if (options.discover && results.some((result) => result.ok)) {
+    discoveryAuth = await getDiscoveryAuth(env, authProvider);
+  }
   if (options.discover) {
     await Promise.all(results.filter((result) => result.ok).map(async (result) => {
       const candidates = new Map(result.events.map((event) => [event.id, event]));
       try {
+        if (!discoveryAuth?.idToken) {
+          throw new Error(`Copy discovery needs a Racket session: ${discoveryAuth?.error || "unknown error"}`);
+        }
         const discovered = await discoverEventCopies(result.groupId, copySeeds[result.groupId] || [],
-          getLisbonDateTimeString());
+          getLisbonDateTimeString(), discoveryAuth.idToken);
         copySeeds[result.groupId] = discovered.seeds;
         result.copyQueryCount = discovered.copyQueryCount;
         for (const event of discovered.candidates) {
@@ -4228,6 +4394,9 @@ async function executeMonitorCheck(
         }
       } catch (error) {
         result.copyDiscoveryError = error instanceof Error ? error.message : String(error);
+        if (discoveryAuth?.personId && isAuthFailure(result.copyDiscoveryError)) {
+          await authProvider.invalidate(discoveryAuth.personId);
+        }
       }
       // Keep undated candidates from the durable queue even when they no longer
       // appear in the parent queries or discovery temporarily fails.
@@ -4322,13 +4491,19 @@ async function executeMonitorCheck(
       eventCount: result.events.length,
       durationMs: Date.now() - startedAt,
     });
-    if (options.discover) await notifyIfEventsAppeared(env, result, log);
+    // The notification must not delay registration: send it alongside the joins.
+    const notification = options.discover
+      ? notifyIfEventsAppeared(env, result, log).catch((error) => {
+          console.error("Event notification failed:", error);
+        })
+      : Promise.resolve();
 
     const groupConfig = result.groupConfig || {
       id: result.groupId, enabled: true, joinSingles: true, joinDoubles: false, doublesTeams: [],
     };
     if (options.discover) log("copy_discovery_finished", {
       groupId: result.groupId, seedCount: copySeeds[result.groupId]?.length || 0,
+      authenticatedAs: discoveryAuth?.personName, authSource: discoveryAuth?.source,
       copyQueryCount: result.copyQueryCount, eventIds: result.events.map((event) => event.id),
       preparingEventIds: result.preparingEvents?.map((event) => event.id) || [],
     });
@@ -4340,6 +4515,7 @@ async function executeMonitorCheck(
     }
 
     if (!result.hasEvents) {
+      await notification;
       continue;
     }
 
@@ -4357,7 +4533,9 @@ async function executeMonitorCheck(
         });
       },
       !options.discover,
+      authProvider,
     );
+    await notification;
   }
 
   log("monitor_check_finished", {
@@ -4373,6 +4551,49 @@ async function executeMonitorCheck(
     eventCount,
     hadErrors,
   };
+}
+
+// Between full discoveries, one cheap group query per group checks whether a
+// new joinable event was published. A hit triggers full discovery at once.
+export async function probeForNewGroupEvents(
+  env: Env,
+  pending: PendingMonitorEvent[],
+): Promise<boolean> {
+  const groups = (await getMonitoredGroups(env)).filter((group) => group.enabled);
+  const found = await Promise.all(groups.map(async (group) => {
+    try {
+      const [events, activeIds] = await Promise.all([
+        queryGroupEvents(group.id),
+        getActiveJoinEventIds(env, group.id),
+      ]);
+      const known = new Set([
+        ...activeIds,
+        ...pending.filter((item) => item.groupId === group.id).map((item) => item.event.id),
+      ]);
+      return events.some((event) => isEventEnabledForGroup(event, group) && !known.has(event.id));
+    } catch (error) {
+      console.warn(`Group probe failed for ${group.id}:`, error);
+      return false;
+    }
+  }));
+  return found.some(Boolean);
+}
+
+async function warmRacketSessions(env: Env): Promise<void> {
+  const provider = createRacketAuthProvider(env);
+  let attempted = 0;
+  for (const person of await getPeopleToJoin(env)) {
+    if (attempted >= AUTH_WARM_MAX_PER_TICK) break;
+    if (await provider.isFresh(person, AUTH_WARM_VALIDITY_MS)) continue;
+    if (await isBackgroundAuthPaused(env, person.id)) continue;
+    attempted += 1;
+    try {
+      await provider.get(person, AUTH_WARM_VALIDITY_MS);
+    } catch (error) {
+      await pauseBackgroundAuth(env, person.id);
+      console.warn(`Racket session warm-up failed for ${person.id}:`, error);
+    }
+  }
 }
 
 export class MonitorScheduler {
@@ -4444,52 +4665,62 @@ export class MonitorScheduler {
 
     let pending = await this.state.storage.get<PendingMonitorEvent[]>(MONITOR_PENDING_EVENTS_KEY) || [];
     let lastDiscoveryAt = await this.state.storage.get<number>(MONITOR_LAST_DISCOVERY_KEY);
-    const discover = lastDiscoveryAt === undefined ||
+    let discover = lastDiscoveryAt === undefined ||
       alarmStartedAt - lastDiscoveryAt >= MONITOR_DISCOVERY_INTERVAL_MS;
+    const probed = !discover &&
+      await probeForNewGroupEvents(this.env, pending).catch(() => false);
+    if (probed) discover = true;
     if (discover) {
       lastDiscoveryAt = alarmStartedAt;
       await this.state.storage.put(MONITOR_LAST_DISCOVERY_KEY, lastDiscoveryAt);
     }
-    const minuteBucket = Math.floor(alarmStartedAt / 60_000);
-    const previousRoutineLogMinute = await this.state.storage.get<number>(
-      MONITOR_ROUTINE_LOG_MINUTE_KEY,
-    );
-    const persistRoutineLog = previousRoutineLogMinute !== minuteBucket;
-    if (persistRoutineLog) {
-      await this.state.storage.put(MONITOR_ROUTINE_LOG_MINUTE_KEY, minuteBucket);
+    // A plain ten-second tick with nothing pending only needed the probe.
+    if (discover || pending.length) {
+      const minuteBucket = Math.floor(alarmStartedAt / 60_000);
+      const previousRoutineLogMinute = await this.state.storage.get<number>(
+        MONITOR_ROUTINE_LOG_MINUTE_KEY,
+      );
+      const persistRoutineLog = previousRoutineLogMinute !== minuteBucket;
+      if (persistRoutineLog) {
+        await this.state.storage.put(MONITOR_ROUTINE_LOG_MINUTE_KEY, minuteBucket);
+      }
+      try {
+        const outcome = await executeMonitorCheck(this.env, this.state, {
+          trigger: probed ? "group-probe" : discover ? "discovery-minute" : "alarm-10s",
+          scheduledTime: alarmStartedAt,
+          persistRoutineLog,
+          discover,
+          pendingEvents: pending,
+          copySeeds: await this.state.storage.get<CopySeedsByGroup>(MONITOR_COPY_SEEDS_KEY) || {},
+        });
+        pending = outcome.pendingEvents;
+        await this.state.storage.put(MONITOR_PENDING_EVENTS_KEY, pending);
+        await this.state.storage.put(MONITOR_COPY_SEEDS_KEY, outcome.copySeeds);
+      } catch (error) {
+        const runId = `alarm-${alarmStartedAt}-${crypto.randomUUID().slice(0, 8)}`;
+        const log = createOperationalLogger(this.env, this.state, {
+          runId,
+          trigger: probed ? "group-probe" : discover ? "discovery-minute" : "alarm-10s",
+        });
+        log("monitor_check_failed", {
+          intervalMs: discover ? MONITOR_DISCOVERY_INTERVAL_MS : MONITOR_POLL_INTERVAL_MS,
+          durationMs: Date.now() - alarmStartedAt,
+          error: error instanceof Error ? error.message : String(error),
+        }, "error");
+        console.error("Racket monitor alarm failed:", error);
+      }
     }
 
-    try {
-      const outcome = await executeMonitorCheck(this.env, this.state, {
-        trigger: discover ? "discovery-minute" : "alarm-10s",
-        scheduledTime: alarmStartedAt,
-        persistRoutineLog,
-        discover,
-        pendingEvents: pending,
-        copySeeds: await this.state.storage.get<CopySeedsByGroup>(MONITOR_COPY_SEEDS_KEY) || {},
-      });
-      pending = outcome.pendingEvents;
-      await this.state.storage.put(MONITOR_PENDING_EVENTS_KEY, pending);
-      await this.state.storage.put(MONITOR_COPY_SEEDS_KEY, outcome.copySeeds);
-    } catch (error) {
-      const runId = `alarm-${alarmStartedAt}-${crypto.randomUUID().slice(0, 8)}`;
-      const log = createOperationalLogger(this.env, this.state, {
-        runId,
-        trigger: discover ? "discovery-minute" : "alarm-10s",
-      });
-      log("monitor_check_failed", {
-        intervalMs: discover ? MONITOR_DISCOVERY_INTERVAL_MS : MONITOR_POLL_INTERVAL_MS,
-        durationMs: Date.now() - alarmStartedAt,
-        error: error instanceof Error ? error.message : String(error),
-      }, "error");
-      console.error("Racket monitor alarm failed:", error);
+    if (!discover && !pending.length) {
+      try {
+        await warmRacketSessions(this.env);
+      } catch (error) {
+        console.warn("Racket session warm-up failed:", error);
+      }
     }
 
-    const discoveryAlarmAt = Math.max(Date.now() + 100,
-      (lastDiscoveryAt ?? alarmStartedAt) + MONITOR_DISCOVERY_INTERVAL_MS);
-    await this.state.storage.setAlarm(pending.length
-      ? Math.min(nextMonitorAlarmAt(alarmStartedAt), discoveryAlarmAt)
-      : discoveryAlarmAt);
+    // Every tick probes the group; full discovery still runs once a minute.
+    await this.state.storage.setAlarm(nextMonitorAlarmAt(alarmStartedAt));
   }
 }
 
@@ -4633,6 +4864,58 @@ export default {
       ) ? requestedView as OperationLogView : "join";
       const id = env.OPERATION_LOGS.idFromName("global");
       return new OperationLogStoreClient(env.OPERATION_LOGS.get(id)).read(limit, view);
+    }
+
+    // Read-only: runs authenticated copy discovery for a group and reports what
+    // the scheduler would track, without joining or saving anything.
+    if (url.pathname === "/discovery-preview") {
+      const unauthorizedResponse = requireJoinSecret(request, env);
+      if (unauthorizedResponse) return unauthorizedResponse;
+      const groups = await getMonitoredGroups(env);
+      const groupId = normalizeMonitoredGroupId(url.searchParams.get("group")) ||
+        groups.find((group) => group.enabled)?.id;
+      if (!groupId) {
+        return jsonResponse({ ok: false, error: "Pass ?group=<id or URL>." }, { status: 400 });
+      }
+      const discoveryAuth = await getDiscoveryAuth(env, createRacketAuthProvider(env));
+      if (!discoveryAuth.idToken) {
+        return jsonResponse({ ok: false, groupId, error: discoveryAuth.error }, { status: 502 });
+      }
+      try {
+        const now = getLisbonDateTimeString();
+        const discovered = await discoverEventCopies(groupId, [], now, discoveryAuth.idToken);
+        const candidates = await Promise.all(discovered.candidates.map(async (event) => {
+          const product = await getFirestoreDocument(`IProducts/${event.id}`).catch(() => null);
+          const groupValue = product ? fieldString(product.fields, "group") ?? "" : undefined;
+          return {
+            ...event,
+            group: groupValue,
+            hiddenFromGroup: groupValue === undefined ? undefined : groupValue !== groupId,
+            copiedFrom: product ? fieldString(product.fields, "copiedFrom") : undefined,
+            registeredCount: product
+              ? Object.keys(product.fields?.users?.mapValue?.fields || {}).length
+              : undefined,
+            slots: product ? Number(product.fields?.slots?.integerValue || 0) : undefined,
+          };
+        }));
+        return jsonResponse({
+          ok: true,
+          groupId,
+          checkedAt: now,
+          authenticatedAs: discoveryAuth.personName,
+          authSource: discoveryAuth.source,
+          seedCount: discovered.seeds.length,
+          copyQueryCount: discovered.copyQueryCount,
+          candidates,
+        });
+      } catch (error) {
+        return jsonResponse({
+          ok: false,
+          groupId,
+          authenticatedAs: discoveryAuth.personName,
+          error: error instanceof Error ? error.message : String(error),
+        }, { status: 502 });
+      }
     }
 
     if (url.pathname === "/status") {

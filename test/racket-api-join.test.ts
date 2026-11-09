@@ -3,6 +3,7 @@ import {
   buildApiJoinPatch,
   buildApiTeamJoinPatch,
   joinEventViaApi,
+  isWriteConflict,
   joinTeamEventViaApi,
   type ApiJoinAttemptTelemetry,
   type FirestoreDocument,
@@ -238,7 +239,7 @@ describe("direct Racket API join patch", () => {
 
   it("reports every optimistic-write conflict before falling back", async () => {
     const attempts: ApiJoinAttemptTelemetry[] = [];
-    const responses = Array.from({ length: 3 }).flatMap(() => [
+    const responses = Array.from({ length: 5 }).flatMap(() => [
       Response.json(product()),
       new Response("conflict", { status: 412 }),
     ]);
@@ -257,9 +258,51 @@ describe("direct Racket API join patch", () => {
       ok: false,
       reason: "The event changed during all API join attempts.",
     });
-    expect(attempts).toHaveLength(3);
+    expect(attempts).toHaveLength(5);
     expect(attempts.every((attempt) =>
       attempt.outcome === "write_conflict" && attempt.writeStatus === 412
     )).toBe(true);
+  });
+
+  it("retries a 400 FAILED_PRECONDITION immediately and returns the written document", async () => {
+    const attempts: ApiJoinAttemptTelemetry[] = [];
+    const written = {
+      ...product(),
+      fields: {
+        ...product().fields,
+        reserves: { arrayValue: { values: [{ stringValue: "anton" }] } },
+      },
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(product()))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: {
+        code: 400,
+        message: "the stored version does not match the required base version",
+        status: "FAILED_PRECONDITION",
+      } }), { status: 400 }))
+      .mockResolvedValueOnce(Response.json(product()))
+      .mockResolvedValueOnce(Response.json(written));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await joinEventViaApi(
+      "event",
+      { idToken: "token", racketUserId: "anton" },
+      "2026-07-27 12:34:56",
+      (attempt) => attempts.push(attempt),
+    );
+
+    expect(attempts.map((attempt) => attempt.outcome)).toEqual([
+      "write_conflict",
+      "write_succeeded",
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.document?.fields?.reserves).toEqual(written.fields.reserves);
+  });
+
+  it("does not treat other 400 errors as conflicts", () => {
+    expect(isWriteConflict(400, '{"error":{"status":"INVALID_ARGUMENT"}}')).toBe(false);
+    expect(isWriteConflict(400, '{"error":{"status":"FAILED_PRECONDITION"}}')).toBe(true);
+    expect(isWriteConflict(409, "")).toBe(true);
+    expect(isWriteConflict(412, "")).toBe(true);
   });
 });

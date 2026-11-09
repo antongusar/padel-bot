@@ -47,8 +47,12 @@ describe("ten-second monitor scheduler", () => {
       failCopies: (failed: boolean) => void;
       clearSeedGroup: () => void;
       failRead: (failed: boolean) => void;
-      authRequests: () => number;
-      requests: () => { discovery: number; direct: number };
+      writes: () => number;
+      logins: () => number;
+      copyQueries: () => number;
+      dropSession: () => Promise<void>;
+      failLogins: (failed: boolean) => void;
+      requests: () => { group: number; direct: number };
       advance: (ms: number) => void;
       complete: () => Promise<void>;
       addEvent: () => void;
@@ -66,8 +70,11 @@ describe("ten-second monitor scheduler", () => {
     let count = 9;
     let hidden = false;
     let readFailed = false;
-    let authRequests = 0;
-    let discoveryRequests = 0;
+    let writes = 0;
+    let logins = 0;
+    let copyQueries = 0;
+    let loginsFail = false;
+    let groupRequests = 0;
     let directRequests = 0;
     let additionalEvent = false;
     let copyScenario = false;
@@ -102,12 +109,17 @@ describe("ten-second monitor scheduler", () => {
         ) } },
       },
     });
+    const authorized = (init?: RequestInit) =>
+      new Headers(init?.headers).get("authorization") === "Bearer racket-token";
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = String(input);
       if (url.includes("documents:runQuery")) {
         const query = JSON.parse(String(init?.body)).structuredQuery;
         if (query.select) {
           if (query.where.fieldFilter.field.fieldPath === "copiedFrom") {
+            copyQueries++;
+            // Production Firestore rules reject anonymous copiedFrom queries.
+            if (!authorized(init)) return response([{ error: { code: 403, status: "PERMISSION_DENIED" } }], 403);
             if (copiesFailed) return response({ error: "unavailable" }, 503);
             const filter = query.where.fieldFilter;
             const parents = filter.value.arrayValue?.values.map((v: { stringValue: string }) => v.stringValue)
@@ -123,21 +135,40 @@ describe("ten-second monitor scheduler", () => {
             },
           } }] : []);
         }
-        discoveryRequests++;
+        groupRequests++;
         return response(hidden ? [] : [
           { document: product() },
           ...additionalEvent ? [{ document: product(`${eventId}-new`) }] : [],
         ]);
       }
       if (url.includes(`/IProducts/${eventId}`)) {
+        const id = url.includes(`${eventId}-new?`) ? `${eventId}-new` : eventId;
+        if (init?.method === "PATCH") {
+          // Every registration attempt reaches the write; fail it so the
+          // coordinator records an attempt without completing the event.
+          writes++;
+          return response({ error: { code: 503, status: "UNAVAILABLE" } }, 503);
+        }
+        if (authorized(init)) return response({ ...product(id), updateTime: "2026-01-01T00:00:00Z" });
         directRequests++;
-        return readFailed ? response({ error: "unavailable" }, 503) : response(
-          product(url.includes(`${eventId}-new?`) ? `${eventId}-new` : eventId),
-        );
+        return readFailed ? response({ error: "unavailable" }, 503) : response(product(id));
       }
       if (url.endsWith("/preloginUser")) {
-        authRequests++;
-        return response({ result: { success: false, error: "Simulated auth failure" } });
+        logins++;
+        return response(loginsFail
+          ? { result: { success: false, error: "Wrong password" } }
+          : { result: { success: true, userIds: ["racket-player"] } });
+      }
+      if (url.endsWith("/loginUser")) {
+        return response({ result: { success: true, jwt: "custom-token" } });
+      }
+      if (url.includes("accounts:signInWithCustomToken")) {
+        return response({
+          idToken: "racket-token",
+          refreshToken: "refresh-token",
+          expiresIn: "3600",
+          localId: "firebase-player",
+        });
       }
       throw new Error(`Unexpected test request: ${url}`);
     });
@@ -163,8 +194,12 @@ describe("ten-second monitor scheduler", () => {
         failCopies: (value) => { copiesFailed = value; },
         clearSeedGroup: () => { seedInGroup = false; },
         failRead: (value) => { readFailed = value; },
-        authRequests: () => authRequests,
-        requests: () => ({ discovery: discoveryRequests, direct: directRequests }),
+        writes: () => writes,
+        logins: () => logins,
+        copyQueries: () => copyQueries,
+        dropSession: () => env.MONITOR_STATE.delete("racket_auth:player"),
+        failLogins: (value) => { loginsFail = value; },
+        requests: () => ({ group: groupRequests, direct: directRequests }),
         advance: (ms) => { time += ms; },
         addEvent: () => { additionalEvent = true; },
         complete: async () => {
@@ -196,6 +231,7 @@ describe("ten-second monitor scheduler", () => {
       }
       await Promise.all([
         `active_join_event:${groupId}`, `active_join_events:${groupId}`, `last_has_events:${groupId}`,
+        "racket_auth:player", "racket_auth_backoff:player",
       ].map((key) => env.MONITOR_STATE.delete(key)));
     }
   }
@@ -204,23 +240,26 @@ describe("ten-second monitor scheduler", () => {
     await participantMonitor(async (monitor) => {
       await monitor.tick();
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(0);
+      expect(monitor.writes()).toBe(0);
       expect((await monitor.state()).attemptsByPerson).toEqual({});
       expect(await monitor.mode()).toBe("10s");
-      expect(monitor.requests()).toEqual({ discovery: 1, direct: 1 });
+      // Discovery, then one ten-second probe plus the pending event read.
+      expect(monitor.requests()).toEqual({ group: 2, direct: 1 });
 
       monitor.hide();
       monitor.setCount(10);
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(1);
+      expect(monitor.writes()).toBe(1);
       expect((await monitor.state()).attemptsByPerson).toEqual({ player: 1 });
       expect(await monitor.mode()).toBe("10s");
 
       monitor.setCount(9);
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(2);
+      expect(monitor.writes()).toBe(2);
       expect((await monitor.state()).attemptsByPerson).toEqual({ player: 2 });
-      expect(monitor.requests()).toEqual({ discovery: 1, direct: 3 });
+      expect(monitor.requests()).toEqual({ group: 4, direct: 3 });
+      // Discovery and both join attempts share one cached Racket session.
+      expect(monitor.logins()).toBe(1);
     });
   });
 
@@ -230,29 +269,31 @@ describe("ten-second monitor scheduler", () => {
       monitor.setCount(10);
       monitor.failRead(true);
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(0);
+      expect(monitor.writes()).toBe(0);
       expect((await monitor.state()).attemptsByPerson).toEqual({});
       expect(await monitor.mode()).toBe("10s");
 
       monitor.failRead(false);
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(1);
+      expect(monitor.writes()).toBe(1);
       expect((await monitor.state()).attemptsByPerson).toEqual({ player: 1 });
     });
   });
 
-  it("finds an initially hidden undated copy, persists it through discovery, and joins only after date and threshold", async () => {
+  it("finds an initially hidden undated copy with an authenticated query, persists it, and joins only after date and threshold", async () => {
     await participantMonitor(async (monitor) => {
       monitor.hideInitially();
       monitor.setDate(false);
       monitor.setCount(10);
       await monitor.tick();
+      // Parent, then the found copy itself; the mock rejects them unless signed in.
+      expect(monitor.copyQueries()).toBe(2);
       expect(await monitor.mode()).toBe("10s");
       expect(await monitor.durableQueue()).toBe(1);
-      expect(monitor.authRequests()).toBe(0);
+      expect(monitor.writes()).toBe(0);
       expect((await monitor.state()).attemptsByPerson).toEqual({});
       await monitor.restart();
-      expect(monitor.requests()).toEqual({ discovery: 1, direct: 1 });
+      expect(monitor.requests()).toEqual({ group: 2, direct: 1 });
 
       // The source disappears and queries fail; the persisted ID must survive
       // both the next minute's discovery and a subsequent direct read failure.
@@ -264,16 +305,16 @@ describe("ten-second monitor scheduler", () => {
       monitor.failRead(true);
       await monitor.tick();
       expect(await monitor.durableQueue()).toBe(1);
-      expect(monitor.authRequests()).toBe(0);
+      expect(monitor.writes()).toBe(0);
 
       monitor.failRead(false);
       monitor.setDate(true);
       monitor.setCount(9);
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(0);
+      expect(monitor.writes()).toBe(0);
       monitor.setCount(10);
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(1);
+      expect(monitor.writes()).toBe(1);
       expect((await monitor.state()).attemptsByPerson).toEqual({ player: 1 });
     });
   });
@@ -286,33 +327,58 @@ describe("ten-second monitor scheduler", () => {
       monitor.advance(60_000);
       await monitor.tick();
       expect(await monitor.durableQueue()).toBe(1);
-      expect(monitor.authRequests()).toBe(0);
+      expect(monitor.writes()).toBe(0);
       monitor.setCount(10);
       await monitor.tick();
-      expect(monitor.authRequests()).toBe(1);
+      expect(monitor.writes()).toBe(1);
     });
   });
 
-  it("stops fast checks after completion but still discovers later events every minute", async () => {
+  it("only probes the group after completion and handles a newly published event on the next ten-second tick", async () => {
     await participantMonitor(async (monitor) => {
       await monitor.tick();
       await monitor.complete();
       await monitor.tick();
       expect(await monitor.mode()).toBe("minute");
-      expect(monitor.requests()).toEqual({ discovery: 1, direct: 1 });
+      expect(monitor.requests()).toEqual({ group: 2, direct: 1 });
 
-      // An early alarm or watchdog must not restart discovery or completed-event reads.
+      // An idle tick costs a single group query and no event reads.
       await monitor.tick();
-      expect(monitor.requests()).toEqual({ discovery: 1, direct: 1 });
+      expect(monitor.requests()).toEqual({ group: 3, direct: 1 });
 
+      // No minute has passed: the probe itself must trigger full discovery.
       monitor.addEvent();
-      monitor.advance(60_000);
       await monitor.tick();
-      expect(monitor.requests().discovery).toBe(2);
+      expect(monitor.requests()).toEqual({ group: 5, direct: 1 });
       expect(await monitor.mode()).toBe("10s");
       await monitor.tick();
-      expect(monitor.requests()).toEqual({ discovery: 2, direct: 2 });
-      expect(monitor.authRequests()).toBe(0);
+      expect(monitor.requests()).toEqual({ group: 6, direct: 2 });
+      expect(monitor.writes()).toBe(0);
+      expect(monitor.logins()).toBe(1);
+    });
+  });
+
+  it("renews player sessions in idle ticks and backs off after a failed login", async () => {
+    await participantMonitor(async (monitor) => {
+      await monitor.tick();
+      await monitor.complete();
+      await monitor.tick();
+      expect(monitor.logins()).toBe(1);
+
+      await monitor.dropSession();
+      await monitor.tick();
+      expect(monitor.logins()).toBe(2);
+      await monitor.tick();
+      expect(monitor.logins()).toBe(2);
+
+      monitor.failLogins(true);
+      await monitor.dropSession();
+      await monitor.tick();
+      expect(monitor.logins()).toBe(3);
+      // A wrong password must not be retried every ten seconds.
+      await monitor.tick();
+      await monitor.tick();
+      expect(monitor.logins()).toBe(3);
     });
   });
 
@@ -322,12 +388,11 @@ describe("ten-second monitor scheduler", () => {
     const groupId = `scheduler-test-${crypto.randomUUID()}`;
     const stub = env.MONITOR_SCHEDULER.getByName(groupId);
 
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
       new Response(JSON.stringify([]), {
         status: 200,
         headers: { "content-type": "application/json" },
-      }),
-    );
+      }));
 
     try {
       await env.MONITOR_STATE.put(
@@ -353,10 +418,11 @@ describe("ten-second monitor scheduler", () => {
       expect(active.mode).toBe("minute");
       expect(active.alarmAt).not.toBeNull();
       expect(active.alarmAt! - Date.now()).toBeGreaterThan(0);
+      // Every tick probes the group, so the next alarm is ten seconds away.
       expect(active.alarmAt! - Date.now()).toBeLessThanOrEqual(
-        60_000 + 100,
+        MONITOR_POLL_INTERVAL_MS + 100,
       );
-      expect(active.alarmAt! - Date.now()).toBeGreaterThan(50_000);
+      expect(active.alarmAt! - Date.now()).toBeGreaterThan(5_000);
 
       const alarmBeforeWatchdog = active.alarmAt;
       await stub.fetch("https://monitor-scheduler.internal/start", { method: "POST" });
