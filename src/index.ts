@@ -21,13 +21,22 @@ import {
   findParticipationInText,
   type ParticipationStatus,
 } from "./join-status";
-import { joinEventViaApi } from "./racket-api-join";
+import { joinEventViaApi, joinTeamEventViaApi } from "./racket-api-join";
+import { discoverEventCopies, isRecentUndatedEvent, type CopySeedsByGroup } from "./event-copy-discovery";
+import {
+  OperationLogStoreClient,
+  type OperationLogLevel,
+  type OperationLogView,
+} from "./operation-log-store";
 
 export { JoinCoordinator } from "./join-coordinator";
+export { OperationLogStore } from "./operation-log-store";
 
 interface Env {
   MONITOR_STATE: KVNamespace;
+  MONITOR_SCHEDULER: DurableObjectNamespace;
   JOIN_COORDINATOR: DurableObjectNamespace;
+  OPERATION_LOGS: DurableObjectNamespace;
   BROWSER: BrowserRun;
   GROUP_ID?: string;
   JOIN_DEBUG_SCREENSHOTS?: string;
@@ -36,7 +45,7 @@ interface Env {
   TELEGRAM_WEBHOOK_SECRET?: string;
 }
 
-interface CheckResult {
+export interface CheckResult {
   checkedAt: string;
   ok: boolean;
   groupId: string;
@@ -45,16 +54,23 @@ interface CheckResult {
   emptyStateTextFound: boolean;
   source: "firestore";
   events: EventSummary[];
+  preparingEvents?: EventSummary[];
+  copyDiscoveryError?: string;
+  copyQueryCount?: number;
+  groupConfig?: MonitoredGroup;
   visibleTextPreview: string;
   error?: string;
 }
 
-interface EventSummary {
+export interface EventSummary {
   id: string;
   title?: string;
   date?: string;
+  doubles?: boolean;
   teamSignup?: boolean;
   fixedTeams?: boolean;
+  registeredCount?: number;
+  reserveCount?: number;
 }
 
 interface BrowserJoinDebug {
@@ -97,7 +113,7 @@ interface RacketLoginResult {
   error?: string;
 }
 
-interface FirestoreDocument {
+export interface FirestoreDocument {
   name: string;
   fields?: FirestoreFields;
   createTime?: string;
@@ -131,7 +147,15 @@ const ROSTER_KEY = "roster";
 const SCHEDULE_KEY = "schedule";
 const MONITORED_GROUPS_KEY = "monitored_groups";
 const ACTIVE_JOIN_EVENT_KEY = "active_join_event";
+const ACTIVE_JOIN_EVENTS_KEY = "active_join_events";
 const DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+const MONITOR_POLL_INTERVAL_MS = 10_000;
+const MONITOR_DISCOVERY_INTERVAL_MS = 60_000;
+const MONITOR_SCHEDULER_NAME = "global";
+const MONITOR_PENDING_EVENTS_KEY = "pending-events";
+const MONITOR_COPY_SEEDS_KEY = "copy-seeds";
+const MONITOR_LAST_DISCOVERY_KEY = "last-discovery-at";
+const MONITOR_ROUTINE_LOG_MINUTE_KEY = "routine-log-minute";
 
 type JoinOutcome = { ok: boolean; reason?: string };
 
@@ -143,9 +167,26 @@ interface Person {
   enabled: boolean;
 }
 
+export interface DoublesTeam {
+  id: string;
+  leaderId: string;
+  partnerId: string | null;
+  enabled: boolean;
+}
+
+interface JoinCandidate extends Person {
+  leader: Person;
+  partner: Person | null;
+  doublesTeamId?: string;
+}
+
 export interface MonitoredGroup {
   id: string;
   enabled: boolean;
+  joinSingles: boolean;
+  joinDoubles: boolean;
+  doublesTeams: DoublesTeam[];
+  minParticipants?: number;
 }
 
 export interface Schedule {
@@ -164,12 +205,19 @@ interface TelegramUpdate {
   };
 }
 
-type OperationalLogLevel = "info" | "warn" | "error";
+type OperationalLogger = (
+  action: string,
+  details?: Record<string, unknown>,
+  level?: OperationLogLevel,
+) => void;
 
-function operationalLog(
+type WaitUntilContext = Pick<ExecutionContext, "waitUntil">;
+type AutoJoinStatus = "complete" | "retry" | "terminal";
+
+function consoleOperationalLog(
   action: string,
   details: Record<string, unknown> = {},
-  level: OperationalLogLevel = "info",
+  level: OperationLogLevel = "info",
 ): void {
   const entry = JSON.stringify({
     type: "racket-monitor",
@@ -180,6 +228,39 @@ function operationalLog(
   if (level === "error") console.error(entry);
   else if (level === "warn") console.warn(entry);
   else console.log(entry);
+}
+
+function createOperationalLogger(
+  env: Env,
+  ctx: WaitUntilContext,
+  options: { runId: string; trigger: string },
+): OperationalLogger {
+  const id = env.OPERATION_LOGS.idFromName("global");
+  const client = new OperationLogStoreClient(env.OPERATION_LOGS.get(id));
+  let sequence = 0;
+
+  return (action, details = {}, level = "info") => {
+    sequence += 1;
+    const timestamp = new Date().toISOString();
+    consoleOperationalLog(action, {
+      runId: options.runId,
+      trigger: options.trigger,
+      ...details,
+    }, level);
+    ctx.waitUntil(
+      client.append({
+        timestamp,
+        action,
+        level,
+        sequence,
+        runId: options.runId,
+        trigger: options.trigger,
+        details,
+      }).catch((error) => {
+        console.error("Operation log persistence failed:", error);
+      }),
+    );
+  };
 }
 
 function getLisbonDateTimeString(date = new Date()): string {
@@ -291,26 +372,75 @@ async function queryGroupEvents(groupId: string, limit = 10): Promise<EventSumma
         id: document.name.split("/").pop() || document.name,
         title: fieldString(document.fields, "title"),
         date: fieldString(document.fields, "date"),
+        doubles: fieldBool(document.fields, "doubles"),
         teamSignup: fieldBool(document.fields, "teamSignup"),
         fixedTeams: fieldBool(document.fields, "fixedTeams"),
+        registeredCount: Object.keys(document.fields?.users?.mapValue?.fields || {}).length,
+        reserveCount: firestoreStringArray(document.fields?.reserves).length,
       };
     });
 }
 
-// Team-signup / fixed-teams events need a partner in the Registration Checkout
-// ("Add partner..."), which the join flow does not handle — skip them. The
-// Firestore flags are the reliable signal; the title match is a fallback.
-const NON_JOINABLE_TITLE_PATTERN = /doubles/i;
-
-function isJoinableEvent(event: EventSummary): boolean {
-  if (event.teamSignup || event.fixedTeams) {
-    return false;
-  }
-  return !NON_JOINABLE_TITLE_PATTERN.test(event.title || "");
+function isDoublesEvent(event: EventSummary): boolean {
+  return Boolean(event.teamSignup || event.fixedTeams);
 }
 
-function pickJoinableEvent(events: EventSummary[]): EventSummary | undefined {
-  return events.find(isJoinableEvent);
+function isEventEnabledForGroup(
+  event: EventSummary,
+  group?: MonitoredGroup,
+): boolean {
+  return isDoublesEvent(event)
+    ? Boolean(group?.joinDoubles && group.doublesTeams.some((team) => team.enabled))
+    : group?.joinSingles !== false;
+}
+
+export function isWaitingForConfiguredEventType(
+  events: EventSummary[],
+  group: MonitoredGroup,
+): boolean {
+  const hasSingles = events.some((event) => !isDoublesEvent(event));
+  const hasDoubles = events.some(isDoublesEvent);
+  const expectsDoubles = group.joinDoubles &&
+    group.doublesTeams.some((team) => team.enabled);
+  return (group.joinSingles && !hasSingles) || (expectsDoubles && !hasDoubles);
+}
+
+function pickJoinableEvent(
+  events: EventSummary[],
+  group?: MonitoredGroup,
+): EventSummary | undefined {
+  return events.find((event) => isEventEnabledForGroup(event, group));
+}
+
+export function eventNotificationState(events: EventSummary[]): string {
+  if (!events.length) return "false";
+  return `events:${events
+    .map((event) => `${event.id}:${isDoublesEvent(event) ? "doubles" : "singles"}`)
+    .sort()
+    .join(",")}`;
+}
+
+export function formatEventsTelegramMessage(
+  result: CheckResult,
+  group?: MonitoredGroup,
+): string {
+  const lines = result.events.map((event, index) => {
+    const title = event.title || event.date || event.id;
+    const date = event.date && event.date !== title ? ` (${event.date})` : "";
+    const eventType = isDoublesEvent(event) ? "парное" : "обычное";
+    const decision = isEventEnabledForGroup(event, group)
+      ? `${eventType}, подходит для автозаписи`
+      : `${eventType}, автозапись выключена в настройках группы`;
+    return `${index + 1}. ${title}${date} — ${decision}.`;
+  });
+  const detectedAt = getLisbonDateTimeString(new Date(result.checkedAt));
+
+  return [
+    `События в группе ${result.groupId}:`,
+    ...lines,
+    `Обнаружено ботом: ${detectedAt} (Лиссабон).`,
+    result.groupUrl,
+  ].join("\n");
 }
 
 function groupUrl(groupId: string): string {
@@ -353,18 +483,78 @@ export function normalizeMonitoredGroups(raw: unknown): MonitoredGroup[] {
     const id = normalizeMonitoredGroupId(record ? record.id : value);
     if (!id || seen.has(id)) continue;
     seen.add(id);
+    const doublesTeams = record && Array.isArray(record.doublesTeams)
+      ? record.doublesTeams
+          .map((team): DoublesTeam | null => {
+            if (!team || typeof team !== "object") return null;
+            const fields = team as Record<string, unknown>;
+            const leaderId = String(fields.leaderId ?? "").trim();
+            const rawPartnerId = fields.partnerId;
+            const partnerId = typeof rawPartnerId === "string" && rawPartnerId.trim()
+              ? rawPartnerId.trim()
+              : null;
+            if (!leaderId || partnerId === leaderId) return null;
+            return {
+              id: String(fields.id ?? crypto.randomUUID()),
+              leaderId,
+              partnerId,
+              enabled: fields.enabled !== false,
+            };
+          })
+          .filter((team): team is DoublesTeam => team !== null)
+      : [];
     groups.push({
       id,
       enabled: record ? record.enabled !== false : true,
+      joinSingles: record ? record.joinSingles !== false : true,
+      joinDoubles: record ? record.joinDoubles === true : false,
+      doublesTeams,
+      minParticipants: normalizeMinParticipants(record?.minParticipants),
     });
   }
   return groups;
+}
+
+export function normalizeMinParticipants(value: unknown): number {
+  if (value === undefined || value === null || value === "") return 10;
+  const count = Number(value);
+  return Number.isFinite(count) ? Math.min(10_000, Math.max(0, Math.floor(count))) : 10;
 }
 
 export function enabledMonitoredGroupIds(
   groups: MonitoredGroup[],
 ): string[] {
   return groups.filter((group) => group.enabled).map((group) => group.id);
+}
+
+export function validateDoublesTeamSettings(
+  groups: MonitoredGroup[],
+  roster: Person[],
+): string | null {
+  const enabledPeople = new Set(
+    roster.filter((person) => person.enabled).map((person) => person.id),
+  );
+  for (const group of groups) {
+    if (!group.joinDoubles) continue;
+    const usedIds = new Set<string>();
+    for (const team of group.doublesTeams.filter((item) => item.enabled)) {
+      if (!enabledPeople.has(team.leaderId)) {
+        return `В группе ${group.id} у пары не выбран включённый первый игрок.`;
+      }
+      if (team.partnerId && !enabledPeople.has(team.partnerId)) {
+        return `В группе ${group.id} выбранный партнёр выключен или удалён.`;
+      }
+      for (const personId of [team.leaderId, team.partnerId].filter(
+        (id): id is string => Boolean(id),
+      )) {
+        if (usedIds.has(personId)) {
+          return `В группе ${group.id} один игрок указан в нескольких парах.`;
+        }
+        usedIds.add(personId);
+      }
+    }
+  }
+  return null;
 }
 
 function fallbackGroupId(env: Env): string | null {
@@ -375,7 +565,16 @@ export function monitoredGroupsFromStoredValue(
   raw: string | null,
   fallbackId: string | null,
 ): MonitoredGroup[] {
-  const fallback = fallbackId ? [{ id: fallbackId, enabled: true }] : [];
+  const fallback = fallbackId
+    ? [{
+        id: fallbackId,
+        enabled: true,
+        joinSingles: true,
+        joinDoubles: false,
+        doublesTeams: [],
+        minParticipants: 10,
+      }]
+    : [];
   if (raw === null) return fallback;
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -399,9 +598,90 @@ async function saveMonitoredGroups(
   await env.MONITOR_STATE.put(MONITORED_GROUPS_KEY, JSON.stringify(groups));
 }
 
-async function checkGroupEvents(groupId: string): Promise<CheckResult> {
+async function getActiveJoinEventIds(env: Env, groupId: string): Promise<string[]> {
+  const raw = await env.MONITOR_STATE.get(`${ACTIVE_JOIN_EVENTS_KEY}:${groupId}`);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        return Array.from(new Set(parsed.map(String).filter(Boolean)));
+      }
+    } catch {
+      // Fall through to the legacy single-event key.
+    }
+  }
+  const legacy = await env.MONITOR_STATE.get(`${ACTIVE_JOIN_EVENT_KEY}:${groupId}`);
+  return legacy ? [legacy] : [];
+}
+
+async function saveActiveJoinEventIds(
+  env: Env,
+  groupId: string,
+  eventIds: string[],
+): Promise<void> {
+  const normalized = Array.from(new Set(eventIds.filter(Boolean)));
+  const key = `${ACTIVE_JOIN_EVENTS_KEY}:${groupId}`;
+  const serialized = JSON.stringify(normalized);
+  if (await env.MONITOR_STATE.get(key) !== serialized) {
+    await env.MONITOR_STATE.put(key, serialized);
+  }
+  const legacyKey = `${ACTIVE_JOIN_EVENT_KEY}:${groupId}`;
+  const first = normalized[0] || "";
+  const legacy = await env.MONITOR_STATE.get(legacyKey);
+  if (first && legacy !== first) {
+    await env.MONITOR_STATE.put(legacyKey, first);
+  } else if (!first && legacy !== null) {
+    await env.MONITOR_STATE.delete(legacyKey);
+  }
+}
+
+async function readKnownEvent(groupId: string, id: string): Promise<EventSummary | null> {
+  let product: FirestoreDocument;
+  try {
+    product = await getFirestoreDocument(`IProducts/${id}`);
+  } catch (error) {
+    if (error instanceof Error &&
+        error.message.startsWith(`Firestore get IProducts/${id} failed: 404 `)) return null;
+    throw error;
+  }
+  const fields = product.fields;
+  const date = fieldString(fields, "date");
+  const currentGroup = fieldString(fields, "group");
+  if (fieldString(fields, "status") !== "instance" ||
+      (!date && !isRecentUndatedEvent(product, getLisbonDateTimeString())) ||
+      (date && (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(date) || date < getLisbonDateTimeString())) ||
+      (currentGroup && currentGroup !== groupId)) {
+    return null;
+  }
+  return {
+    id,
+    title: fieldString(fields, "title"),
+    date,
+    doubles: fieldBool(fields, "doubles"),
+    teamSignup: fieldBool(fields, "teamSignup"),
+    fixedTeams: fieldBool(fields, "fixedTeams"),
+    registeredCount: Object.keys(fields?.users?.mapValue?.fields || {}).length,
+    reserveCount: firestoreStringArray(fields?.reserves).length,
+  };
+}
+
+async function checkGroupEvents(
+  groupId: string,
+  groupConfig?: MonitoredGroup,
+  env?: Env,
+): Promise<CheckResult> {
   const targetGroupUrl = groupUrl(groupId);
   const events = await queryGroupEvents(groupId);
+
+  // An event may be detached from its group after discovery. Keep checking its
+  // document directly while it is upcoming, including while waiting to join.
+  if (env) {
+    const knownIds = await getActiveJoinEventIds(env, groupId);
+    const missingIds = knownIds.filter((id) => !events.some((event) => event.id === id));
+    const knownEvents = await Promise.all(missingIds.map((id) => readKnownEvent(groupId, id)));
+    events.push(...knownEvents.filter((event): event is EventSummary => event !== null && Boolean(event.date)));
+    events.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  }
 
   return {
     checkedAt: new Date().toISOString(),
@@ -412,29 +692,31 @@ async function checkGroupEvents(groupId: string): Promise<CheckResult> {
     emptyStateTextFound: events.length === 0,
     source: "firestore",
     events,
+    groupConfig,
     visibleTextPreview: events.length
       ? `Firestore returned ${events.length} upcoming event(s).`
       : "Firestore returned no upcoming events.",
   };
 }
 
-async function checkMonitoredGroupEvents(env: Env): Promise<CheckResult[]> {
-  const groupIds = enabledMonitoredGroupIds(await getMonitoredGroups(env));
+async function checkMonitoredGroupEvents(env: Env, configuredGroups?: MonitoredGroup[]): Promise<CheckResult[]> {
+  const groups = (configuredGroups ?? await getMonitoredGroups(env)).filter((group) => group.enabled);
   return Promise.all(
-    groupIds.map(async (groupId) => {
+    groups.map(async (group) => {
       try {
-        return await checkGroupEvents(groupId);
+        return await checkGroupEvents(group.id, group, env);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return {
           checkedAt: new Date().toISOString(),
           ok: false,
-          groupId,
-          groupUrl: groupUrl(groupId),
+          groupId: group.id,
+          groupUrl: groupUrl(group.id),
           hasEvents: false,
           emptyStateTextFound: false,
           source: "firestore" as const,
           events: [],
+          groupConfig: group,
           visibleTextPreview: "Firestore group check failed.",
           error: message,
         };
@@ -890,6 +1172,24 @@ async function getJoinStatus(eventId: string, auth: FirebaseAuthResult): Promise
   return { joined: status !== "not_joined", status };
 }
 
+async function getTeamJoinStatus(
+  eventId: string,
+  leaderUserId: string,
+  partnerUserId: string,
+): Promise<{
+  joined: boolean;
+  status: "registered" | "reserve" | "not_joined";
+}> {
+  const product = await getFirestoreDocument(`IProducts/${eventId}`);
+  const users = Object.keys(product.fields?.users?.mapValue?.fields || {});
+  const reserves = firestoreStringArray(product.fields?.reserves);
+  const leaderStatus = findFirestoreParticipation(users, reserves, leaderUserId);
+  const partnerStatus = findFirestoreParticipation(users, reserves, partnerUserId);
+  return leaderStatus !== "not_joined" && leaderStatus === partnerStatus
+    ? { joined: true, status: leaderStatus }
+    : { joined: false, status: "not_joined" };
+}
+
 async function waitForJoinStatus(eventId: string, auth: FirebaseAuthResult): Promise<{
   joined: boolean;
   status: "registered" | "reserve" | "not_joined";
@@ -1056,12 +1356,67 @@ export function isWithinSchedule(schedule: Schedule, date = new Date()): boolean
     : now >= startTime || now <= endTime;
 }
 
+export function monitoringWindowKey(
+  schedule: Schedule,
+  date = new Date(),
+): string | null {
+  if (!isWithinSchedule(schedule, date)) return null;
+  const lisbonDate = getLisbonDateTimeString(date).slice(0, 10);
+  return `${lisbonDate}:${schedule.startTime}-${schedule.endTime}`;
+}
+
+export function nextMonitorAlarmAt(
+  alarmStartedAt: number,
+  now = Date.now(),
+): number {
+  return Math.max(now + 100, alarmStartedAt + MONITOR_POLL_INTERVAL_MS);
+}
+
 async function getPeopleToJoin(env: Env): Promise<Person[]> {
   const roster = await getRoster(env);
   // KV array order is the join priority: the first enabled person is joined first.
   return roster.filter(
     (person) => person.enabled && person.email && person.password,
   );
+}
+
+export function buildJoinCandidates(
+  roster: Person[],
+  event: EventSummary,
+  group?: MonitoredGroup,
+): JoinCandidate[] {
+  const enabledPeople = roster.filter(
+    (person) => person.enabled && person.email && person.password,
+  );
+  if (!isDoublesEvent(event)) {
+    if (group?.joinSingles === false) return [];
+    return enabledPeople.map((person) => ({
+      ...person,
+      leader: person,
+      partner: null,
+    }));
+  }
+
+  if (!group?.joinDoubles) return [];
+  const peopleById = new Map(enabledPeople.map((person) => [person.id, person]));
+  return group.doublesTeams
+    .filter((team) => team.enabled)
+    .map((team): JoinCandidate | null => {
+      const leader = peopleById.get(team.leaderId);
+      const partner = team.partnerId
+        ? peopleById.get(team.partnerId) || null
+        : null;
+      if (!leader || (team.partnerId && !partner)) return null;
+      return {
+        ...leader,
+        id: `team:${team.id}`,
+        name: `${leader.name || leader.email} + ${partner?.name || partner?.email || "Placeholder"}`,
+        leader,
+        partner,
+        doublesTeamId: team.id,
+      };
+    })
+    .filter((candidate): candidate is JoinCandidate => candidate !== null);
 }
 
 async function getBrowserRunSnapshot(env: Env) {
@@ -1129,19 +1484,20 @@ async function getEventParticipationSnapshot(eventId: string) {
   };
 }
 
-async function getApplicationStatus(env: Env) {
+async function getApplicationStatus(env: Env, log: OperationalLogger) {
   const checkedAt = new Date();
-  const [schedule, roster, configuredGroups, browser] = await Promise.all([
+  const [schedule, roster, configuredGroups, browser, scheduler] = await Promise.all([
     getSchedule(env),
     getRoster(env),
     getMonitoredGroups(env),
     getBrowserRunSnapshot(env),
+    getMonitorSchedulerState(env),
   ]);
   const enabledGroups = configuredGroups.filter((group) => group.enabled);
   const checks = await Promise.all(
     enabledGroups.map(async (group) => {
       try {
-        return await checkGroupEvents(group.id);
+        return await checkGroupEvents(group.id, group, env);
       } catch (error) {
         return {
           checkedAt: checkedAt.toISOString(),
@@ -1160,7 +1516,7 @@ async function getApplicationStatus(env: Env) {
   );
 
   const joinableEvents = checks
-    .map((check) => pickJoinableEvent(check.events))
+    .map((check, index) => pickJoinableEvent(check.events, enabledGroups[index]))
     .filter((event): event is EventSummary => Boolean(event));
   const enabledPeople = roster.filter(
     (person) => person.enabled && person.email && person.password,
@@ -1186,22 +1542,30 @@ async function getApplicationStatus(env: Env) {
   }
 
   const groups = await Promise.all(
-    checks.map(async (check) => {
-      const event = pickJoinableEvent(check.events);
-      const [activeEventId, participation] = await Promise.all([
-        env.MONITOR_STATE.get(`${ACTIVE_JOIN_EVENT_KEY}:${check.groupId}`),
+    checks.map(async (check, index) => {
+      const groupConfig = enabledGroups[index];
+      const event = pickJoinableEvent(check.events, groupConfig);
+      const [activeEventIds, participation, joinState] = await Promise.all([
+        getActiveJoinEventIds(env, check.groupId),
         event
           ? getEventParticipationSnapshot(event.id).catch(() => null)
           : Promise.resolve(null),
+        event
+          ? new JoinCoordinatorClient(env.JOIN_COORDINATOR.getByName(event.id))
+            .getState().catch(() => null)
+          : Promise.resolve(null),
       ]);
-      const players = roster.map((person) => {
+      const statusPeople = event && isDoublesEvent(event)
+        ? buildJoinCandidates(roster, event, groupConfig)
+        : roster.map((person) => ({ ...person, leader: person, partner: null }));
+      const players = statusPeople.map((person) => {
         if (!person.enabled) {
           return { id: person.id, name: person.name, status: "disabled" };
         }
         if (!event) {
           return { id: person.id, name: person.name, status: "no_event" };
         }
-        const auth = authByPerson.get(person.id);
+        const auth = authByPerson.get(person.leader.id);
         if (!auth?.racketUserId) {
           return {
             id: person.id,
@@ -1235,7 +1599,11 @@ async function getApplicationStatus(env: Env) {
         ok: check.ok,
         error: check.error,
         upcomingEventCount: check.events.length,
-        activeEventId,
+        activeEventId: activeEventIds[0] || null,
+        activeEventIds,
+        minParticipants: normalizeMinParticipants(groupConfig.minParticipants),
+        hasStartedAutoJoin: Boolean(joinState && (joinState.running || joinState.done ||
+          joinState.joinedIds.length || Object.values(joinState.attemptsByPerson).some((n) => n > 0))),
         event: event
           ? {
               ...event,
@@ -1270,6 +1638,7 @@ async function getApplicationStatus(env: Env) {
       state: monitorState,
       activeNow,
       schedule,
+      scheduler,
       configuredGroupCount: configuredGroups.length,
       enabledGroupCount: enabledGroups.length,
       enabledPlayerCount: enabledPeople.length,
@@ -1279,7 +1648,7 @@ async function getApplicationStatus(env: Env) {
     groups,
   };
 
-  operationalLog("status_snapshot", {
+  log("status_snapshot", {
     monitorState,
     enabledGroupCount: enabledGroups.length,
     liveChecksOk: result.monitor.liveChecksOk,
@@ -1314,8 +1683,24 @@ async function joinEventForPerson(
   debugChatId: string | null,
   heartbeat: () => Promise<void>,
   auth: FirebaseAuthResult | null,
+  log: OperationalLogger,
 ): Promise<PersonJoinResult> {
+  const baseDetails = {
+    groupId: normalizeMonitoredGroupId(groupUrl) || groupUrl,
+    eventId: event.id,
+    personId: person.id,
+    name: person.name,
+  };
+  const browserLog = (
+    action: string,
+    details: Record<string, unknown> = {},
+    level: OperationLogLevel = "info",
+  ) => log(action, { ...baseDetails, ...details }, level);
+  const contextStartedAt = Date.now();
   const context = await browser.createBrowserContext();
+  browserLog("browser_context_created", {
+    durationMs: Date.now() - contextStartedAt,
+  });
   let page: Page | undefined;
 
   const debugShot = async (label: string) => {
@@ -1329,42 +1714,75 @@ async function joinEventForPerson(
   };
 
   const fail = async (reason: string): Promise<PersonJoinResult> => {
+    browserLog("browser_step_failed", { reason }, "warn");
     await debugShot(`Ошибка: ${reason}`);
     return { id: person.id, name: person.name, email: person.email, ok: false, reason };
   };
 
   try {
+    const pageStartedAt = Date.now();
     page = await context.newPage();
     await page.setViewport({ width: 1280, height: 900 });
+    browserLog("browser_page_created", {
+      durationMs: Date.now() - pageStartedAt,
+    });
+    const navigationStartedAt = Date.now();
+    browserLog("browser_navigation_started");
     await page.goto(groupUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    browserLog("browser_navigation_finished", {
+      durationMs: Date.now() - navigationStartedAt,
+      pageUrl: page.url(),
+    });
     await heartbeat();
 
+    const loginButtonStartedAt = Date.now();
     const loginButton = await tryClickByText(page, [{ text: "Log in to join", exact: true }], 15000);
     if (!loginButton) {
       return await fail("Не нашёл кнопку «Log in to join».");
     }
+    browserLog("browser_login_button_clicked", {
+      durationMs: Date.now() - loginButtonStartedAt,
+    });
 
+    const formStartedAt = Date.now();
     await fillLoginForm(page, person.email.trim(), person.password.trim());
+    browserLog("browser_login_form_filled", {
+      durationMs: Date.now() - formStartedAt,
+    });
     await debugShot("1/5 Заполнил форму логина");
 
+    const submitStartedAt = Date.now();
     const loginSubmit = await tryClickByText(page, [{ text: "Log in", exact: true }], 15000, true);
     if (!loginSubmit) {
       return await fail("Не нашёл кнопку отправки логина.");
     }
+    browserLog("browser_login_submitted", {
+      durationMs: Date.now() - submitStartedAt,
+    });
 
+    const loginStartedAt = Date.now();
     const loginResult = await waitForLoginResult(page);
     if (!loginResult || loginResult.startsWith("login-error:")) {
       return await fail(loginResult || "Логин не завершился в браузере.");
     }
+    browserLog("browser_login_finished", {
+      result: loginResult,
+      durationMs: Date.now() - loginStartedAt,
+    });
 
     await heartbeat();
     await sleep(1500);
     await debugShot("2/5 Залогинился");
 
+    const eventClickStartedAt = Date.now();
     const eventClicked = await tryClickEventCard(page, event, 12000);
     if (!eventClicked) {
       return await fail("Не нашёл карточку ивента.");
     }
+    browserLog("browser_event_opened", {
+      eventTitle: event.title,
+      durationMs: Date.now() - eventClickStartedAt,
+    });
 
     await heartbeat();
     await sleep(1500);
@@ -1374,7 +1792,13 @@ async function joinEventForPerson(
 
     // Pre-check: if already in the players list, do not click Join again. This
     // keeps retries idempotent and handles events that hide "Join" once joined.
+    const browserPrecheckStartedAt = Date.now();
     const preCheck = await verifyJoinInBrowser(page, names);
+    browserLog("browser_participation_precheck", {
+      joined: preCheck.joined,
+      status: preCheck.status,
+      durationMs: Date.now() - browserPrecheckStartedAt,
+    });
     if (preCheck.joined) {
       await debugShot(`уже записан: ${person.name}`);
       return {
@@ -1398,9 +1822,17 @@ async function joinEventForPerson(
       { text: "Join reserve" },
       { text: "Join waitlist" },
     ];
+    const joinButtonStartedAt = Date.now();
     let joinClicked = await tryClickByText(page, joinCandidates, 1200);
     if (!joinClicked) {
+      const capacityStartedAt = Date.now();
       const capacity = await getEventCapacity(page);
+      browserLog("browser_capacity_checked", {
+        current: capacity.current,
+        capacity: capacity.capacity,
+        full: capacity.full,
+        durationMs: Date.now() - capacityStartedAt,
+      });
       if (capacity.full) {
         return await fail(
           `Ивент заполнен (${capacity.current}/${capacity.capacity}), а кнопки записи в резерв нет.`,
@@ -1412,11 +1844,15 @@ async function joinEventForPerson(
     if (!joinClicked) {
       return await fail("Не нашёл кнопку «Join».");
     }
+    browserLog("browser_join_clicked", {
+      durationMs: Date.now() - joinButtonStartedAt,
+    });
 
     await sleep(1500);
     await debugShot("4/5 Нажал Join, открылся Registration Checkout");
 
     // The Registration Checkout modal confirms with its own "Join" button (last match in the DOM).
+    const confirmationStartedAt = Date.now();
     const confirmClicked = await tryClickByText(
       page,
       [
@@ -1433,8 +1869,13 @@ async function joinEventForPerson(
         `Checkout confirmation was not found for ${person.name || person.email}; verifying actual status.`,
       );
     }
+    browserLog("browser_checkout_confirmation", {
+      found: confirmClicked,
+      durationMs: Date.now() - confirmationStartedAt,
+    }, confirmClicked ? "info" : "warn");
     await heartbeat();
     await sleep(1500);
+    const finalVerificationStartedAt = Date.now();
     const firestoreCheck = auth
       ? await waitForJoinStatus(event.id, auth).catch((error) => {
           console.warn(
@@ -1454,6 +1895,14 @@ async function joinEventForPerson(
         : browserCheck?.status || "not_joined";
     const matchedName = browserCheck?.matchedName || person.name;
     const playersList = browserCheck?.region || "";
+    browserLog("browser_final_verification", {
+      joined,
+      status,
+      verifiedVia: firestoreCheck?.joined
+        ? `firestore:${firestoreCheck.status}`
+        : joined ? `browser:${matchedName}` : "none",
+      durationMs: Date.now() - finalVerificationStartedAt,
+    }, joined ? "info" : "warn");
 
     await debugShot(
       joined
@@ -1477,8 +1926,12 @@ async function joinEventForPerson(
       playersList,
     };
   } finally {
+    const closeStartedAt = Date.now();
     await page?.close().catch(() => undefined);
     await context.close().catch(() => undefined);
+    browserLog("browser_context_closed", {
+      durationMs: Date.now() - closeStartedAt,
+    });
   }
 }
 
@@ -1490,26 +1943,32 @@ async function joinFirstAvailableEvent(
   env: Env,
   debug = false,
   resetState = false,
+  log: OperationalLogger = consoleOperationalLog,
+  selectedEvent?: EventSummary,
+  groupConfig?: MonitoredGroup,
 ) {
-  const events = await queryGroupEvents(groupId, 10);
-  const event = pickJoinableEvent(events);
+  const events = selectedEvent ? [selectedEvent] : await queryGroupEvents(groupId, 10);
+  const event = selectedEvent || pickJoinableEvent(events, groupConfig);
 
   if (!event) {
     return {
       ok: false,
       reason: events.length
-        ? "Only doubles events found; skipping (needs a partner)."
+        ? "No event is enabled for auto-registration in this group."
         : "No upcoming events found.",
       event: undefined as EventSummary | undefined,
       results: [] as PersonJoinResult[],
     };
   }
 
-  const people = await getPeopleToJoin(env);
+  const roster = await getRoster(env);
+  const people = buildJoinCandidates(roster, event, groupConfig);
   if (!people.length) {
     return {
       ok: false,
-      reason: "No enabled players in the roster.",
+      reason: isDoublesEvent(event)
+        ? "No valid enabled doubles teams are configured for this group."
+        : "No enabled players in the roster.",
       event,
       results: [] as PersonJoinResult[],
     };
@@ -1522,6 +1981,7 @@ async function joinFirstAvailableEvent(
   }
   let browser: Browser | undefined;
   let debugChatId: string | null = null;
+  const batchStartedAt = Date.now();
 
   const batch: CoordinatedBatchResult<PersonJoinResult> = await runCoordinatedBatch({
     coordinator,
@@ -1534,12 +1994,53 @@ async function joinFirstAvailableEvent(
       debugChatId = debug ? await env.MONITOR_STATE.get(TELEGRAM_CHAT_ID_KEY) : null;
     },
     joinPerson: async (person, heartbeat) => {
+      const personStartedAt = Date.now();
+      log("join_person_started", {
+        groupId,
+        eventId: event.id,
+        personId: person.id,
+        name: person.name,
+      });
       let auth: FirebaseAuthResult | null = null;
+      let fallbackReason = "API path did not complete.";
+      let apiPhase = "authentication";
       try {
+        const authStartedAt = Date.now();
+        log("racket_auth_started", {
+          groupId,
+          eventId: event.id,
+          personId: person.id,
+          name: person.name,
+        });
         auth = await signInToRacket(person.email, person.password);
+        log("racket_auth_finished", {
+          groupId,
+          eventId: event.id,
+          personId: person.id,
+          name: person.name,
+          durationMs: Date.now() - authStartedAt,
+        });
+
+        apiPhase = "participation_precheck";
+        const precheckStartedAt = Date.now();
+        log("participation_precheck_started", {
+          groupId,
+          eventId: event.id,
+          personId: person.id,
+          name: person.name,
+        });
         const status = await getJoinStatus(event.id, auth);
+        log("participation_precheck_finished", {
+          groupId,
+          eventId: event.id,
+          personId: person.id,
+          name: person.name,
+          joined: status.joined,
+          status: status.status,
+          durationMs: Date.now() - precheckStartedAt,
+        });
         if (status.joined) {
-          return {
+          const result: PersonJoinResult = {
             id: person.id,
             name: person.name,
             email: person.email,
@@ -1549,17 +2050,116 @@ async function joinFirstAvailableEvent(
             alreadyJoined: true,
             status: status.status,
           };
+          log("join_person_finished", {
+            groupId,
+            eventId: event.id,
+            personId: person.id,
+            name: person.name,
+            route: "firestore_precheck",
+            status: result.status,
+            alreadyJoined: true,
+            durationMs: Date.now() - personStartedAt,
+          });
+          return result;
         }
 
-        const apiJoin = await joinEventViaApi(
-          event.id,
-          auth,
-          getLisbonDateTimeString(),
-        );
+        apiPhase = "firestore_join";
+        let partnerAuth: FirebaseAuthResult | null = null;
+        if (isDoublesEvent(event) && person.partner) {
+          const partnerAuthStartedAt = Date.now();
+          log("racket_partner_auth_started", {
+            groupId,
+            eventId: event.id,
+            teamId: person.doublesTeamId,
+            partnerId: person.partner.id,
+            partnerName: person.partner.name,
+          });
+          partnerAuth = await signInToRacket(
+            person.partner.email,
+            person.partner.password,
+          );
+          log("racket_partner_auth_finished", {
+            groupId,
+            eventId: event.id,
+            teamId: person.doublesTeamId,
+            partnerId: person.partner.id,
+            partnerName: person.partner.name,
+            durationMs: Date.now() - partnerAuthStartedAt,
+          });
+        }
+
+        const joinDate = getLisbonDateTimeString();
+        const apiJoin = isDoublesEvent(event)
+          ? await joinTeamEventViaApi(
+              event.id,
+              auth,
+              partnerAuth?.racketUserId || null,
+              joinDate,
+              (attempt) => log(
+                "firestore_team_join_attempt",
+                {
+                  groupId,
+                  eventId: event.id,
+                  teamId: person.doublesTeamId,
+                  personId: person.id,
+                  name: person.name,
+                  partnerMode: person.partner ? "player" : "placeholder",
+                  ...attempt,
+                  reason: attempt.reason?.slice(0, 500),
+                },
+                attempt.outcome === "write_succeeded" ||
+                    attempt.outcome === "already_joined" ||
+                    attempt.outcome === "placeholder_created"
+                  ? "info"
+                  : "warn",
+              ),
+            )
+          : await joinEventViaApi(
+              event.id,
+              auth,
+              joinDate,
+          (attempt) => log(
+            "firestore_join_attempt",
+            {
+              groupId,
+              eventId: event.id,
+              personId: person.id,
+              name: person.name,
+              ...attempt,
+              reason: attempt.reason?.slice(0, 500),
+            },
+            attempt.outcome === "write_succeeded" || attempt.outcome === "already_joined"
+              ? "info"
+              : "warn",
+          ),
+            );
         if (apiJoin.ok) {
-          const verified = await getJoinStatus(event.id, auth);
+          apiPhase = "participation_verification";
+          const verificationStartedAt = Date.now();
+          log("participation_verification_started", {
+            groupId,
+            eventId: event.id,
+            personId: person.id,
+            name: person.name,
+          });
+          const verified = isDoublesEvent(event) && apiJoin.partnerUserId
+            ? await getTeamJoinStatus(
+                event.id,
+                auth.racketUserId,
+                apiJoin.partnerUserId,
+              )
+            : await getJoinStatus(event.id, auth);
+          log("participation_verification_finished", {
+            groupId,
+            eventId: event.id,
+            personId: person.id,
+            name: person.name,
+            joined: verified.joined,
+            status: verified.status,
+            durationMs: Date.now() - verificationStartedAt,
+          }, verified.joined ? "info" : "warn");
           if (verified.joined) {
-            return {
+            const result: PersonJoinResult = {
               id: person.id,
               name: person.name,
               email: person.email,
@@ -1569,27 +2169,118 @@ async function joinFirstAvailableEvent(
               alreadyJoined: apiJoin.alreadyJoined,
               status: verified.status,
             };
+            log("join_person_finished", {
+              groupId,
+              eventId: event.id,
+              personId: person.id,
+              name: person.name,
+              route: "firestore_api",
+              status: result.status,
+              alreadyJoined: result.alreadyJoined,
+              verificationDurationMs: Date.now() - verificationStartedAt,
+              durationMs: Date.now() - personStartedAt,
+            });
+            return result;
           }
+          fallbackReason = "Firestore PATCH succeeded, but participation verification returned not_joined.";
           console.warn(
             `Racket API join was not visible after write for ${person.name || person.email}; falling back to browser.`,
           );
         } else {
+          fallbackReason = apiJoin.reason || "Firestore API returned an unknown failure.";
           console.warn(
             `Racket API join unavailable for ${person.name || person.email}: ${apiJoin.reason || "unknown error"}; falling back to browser.`,
           );
         }
+
+        if (isDoublesEvent(event)) {
+          const result: PersonJoinResult = {
+            id: person.id,
+            name: person.name,
+            email: person.email,
+            ok: false,
+            reason: fallbackReason,
+            verified: false,
+            verifiedVia: "none",
+            status: "not_joined",
+          };
+          log("join_person_finished", {
+            groupId,
+            eventId: event.id,
+            teamId: person.doublesTeamId,
+            personId: person.id,
+            name: person.name,
+            route: "firestore_team_api",
+            ok: false,
+            reason: fallbackReason.slice(0, 500),
+            durationMs: Date.now() - personStartedAt,
+          }, "warn");
+          return result;
+        }
       } catch (error) {
+        fallbackReason = error instanceof Error ? error.message : String(error);
+        log("api_path_failed", {
+          groupId,
+          eventId: event.id,
+          personId: person.id,
+          name: person.name,
+          phase: apiPhase,
+          durationMs: Date.now() - personStartedAt,
+          error: fallbackReason.slice(0, 500),
+        }, "warn");
         console.warn(
           `Racket API join failed for ${person.name || person.email}; falling back to browser:`,
           error,
         );
+        if (isDoublesEvent(event)) {
+          return {
+            id: person.id,
+            name: person.name,
+            email: person.email,
+            ok: false,
+            reason: fallbackReason,
+            verified: false,
+            verifiedVia: "none",
+            status: "not_joined",
+          };
+        }
       }
 
       await heartbeat();
+      const reusedBrowser = Boolean(browser);
+      log("browser_fallback_started", {
+        groupId,
+        eventId: event.id,
+        personId: person.id,
+        name: person.name,
+        reusedBrowser,
+        reason: fallbackReason.slice(0, 500),
+        apiPathDurationMs: Date.now() - personStartedAt,
+      }, "warn");
       if (!browser) {
-        browser = await launch(env.BROWSER, { keep_alive: 60000 });
+        const acquisitionStartedAt = Date.now();
+        try {
+          browser = await launch(env.BROWSER, { keep_alive: 60000 });
+          log("browser_acquired", {
+            groupId,
+            eventId: event.id,
+            personId: person.id,
+            name: person.name,
+            durationMs: Date.now() - acquisitionStartedAt,
+          });
+        } catch (error) {
+          log("browser_acquisition_failed", {
+            groupId,
+            eventId: event.id,
+            personId: person.id,
+            name: person.name,
+            durationMs: Date.now() - acquisitionStartedAt,
+            error: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+          }, "error");
+          throw error;
+        }
       }
-      return joinEventForPerson(
+      const result = await joinEventForPerson(
         browser,
         event,
         person,
@@ -1598,7 +2289,22 @@ async function joinFirstAvailableEvent(
         debugChatId,
         heartbeat,
         auth,
+        log,
       );
+      log("join_person_finished", {
+        groupId,
+        eventId: event.id,
+        personId: person.id,
+        name: person.name,
+        route: "browser",
+        reusedBrowser,
+        ok: result.ok,
+        status: result.status,
+        verifiedVia: result.verifiedVia,
+        reason: result.reason?.slice(0, 500),
+        durationMs: Date.now() - personStartedAt,
+      }, result.ok ? "info" : "warn");
+      return result;
     },
     personError: (person, error) => ({
       id: person.id,
@@ -1635,7 +2341,7 @@ async function joinFirstAvailableEvent(
                 .join("; ")}`
             : undefined);
 
-  operationalLog(
+  log(
     "join_batch_finished",
     {
       groupId,
@@ -1644,6 +2350,7 @@ async function joinFirstAvailableEvent(
       completedNow: batch.completedNow,
       joinedCount,
       totalCount: people.length,
+      durationMs: Date.now() - batchStartedAt,
       results: batch.results.map((result) => ({
         personId: result.id,
         name: result.name,
@@ -1745,6 +2452,7 @@ function renderHomePage(env: Env): Response {
     <tr><td><code>/join</code> <span class="tag">secret</span></td><td>Записать всех включённых игроков на первый ивент первой настроенной группы. Конкретную группу можно выбрать через <code>?group=ID</code>.</td></tr>
     <tr><td><code>/join-test</code> <span class="tag">secret</span></td><td>То же, но в <strong>тестовой</strong> группе.</td></tr>
     <tr><td><code>/join-state?event=...</code> <span class="tag">secret</span></td><td>Показать сохранённое состояние записи конкретного события: блокировку, игроков и попытки.</td></tr>
+    <tr><td><code>/logs</code> <span class="tag">secret</span></td><td>Последние диагностические шаги, сгруппированные по запускам. Хранятся в Durable Object, а не в KV.</td></tr>
     <tr><td><code>/telegram</code></td><td>Webhook бота. Любое сообщение боту сохраняет твой chat_id для уведомлений.</td></tr>
   </table>
   <p class="sub" style="margin-top:.8rem"><span class="tag">secret</span> — нужен <code>JOIN_SECRET</code>: передай как <code>?secret=...</code> или заголовок <code>x-join-secret</code>.</p>
@@ -1840,8 +2548,8 @@ function renderRosterPage(
   table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
   th, td { padding: .5rem .5rem; border-bottom: 1px solid var(--border); text-align: left; }
   th { color: var(--muted); font-weight: 600; font-size: .82rem; }
-  input[type=text], input[type=email], input[type=password] { width: 100%; background: var(--field); border: 1px solid var(--field-border); color: var(--ink); border-radius: 9px; padding: .45rem .55rem; font: inherit; }
-  input[type=text]:focus, input[type=email]:focus, input[type=password]:focus, input[type=time]:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(207, 111, 168, .18); }
+  input[type=text], input[type=email], input[type=password], select { width: 100%; background: var(--field); border: 1px solid var(--field-border); color: var(--ink); border-radius: 9px; padding: .45rem .55rem; font: inherit; }
+  input[type=text]:focus, input[type=email]:focus, input[type=password]:focus, input[type=time]:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(207, 111, 168, .18); }
   input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
   .col-priority { width: 104px; text-align: center; white-space: nowrap; }
   .col-enabled { width: 60px; text-align: center; }
@@ -1849,8 +2557,8 @@ function renderRosterPage(
   button { font: inherit; font-weight: 600; border: 0; border-radius: 11px; padding: .55rem 1.1rem; cursor: pointer; transition: filter .15s, box-shadow .15s; }
   button:hover { filter: brightness(1.03); }
   .btn-add { background: var(--accent-soft); color: #b6478f; margin-top: 1rem; }
-  .group-list { display: grid; gap: .55rem; max-width: 560px; margin-top: .7rem; }
-  .group-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 36px 36px; gap: .55rem; align-items: center; }
+  .group-list { display: grid; gap: .8rem; margin-top: .7rem; }
+  .group-row { display: grid; grid-template-columns: minmax(0, 1fr) auto 36px 36px; gap: .55rem; align-items: center; padding: .8rem; border: 1px solid var(--border); border-radius: 8px; background: #fff; }
   .group-row:has([data-group-enabled]:not(:checked)) [data-group-id] { opacity: .58; }
   .group-runtime { grid-column: 1 / -1; display: flex; align-items: flex-start; gap: .5rem; min-width: 0; padding: .1rem .15rem .35rem; }
   .group-runtime-text { min-width: 0; }
@@ -1858,6 +2566,17 @@ function renderRosterPage(
   .group-runtime-details { color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
   .group-enabled { display: inline-flex; align-items: center; gap: .4rem; color: var(--muted); font-size: .86rem; white-space: nowrap; cursor: pointer; }
   .group-row .btn-remove { width: 36px; height: 36px; padding: 0; }
+  .group-options { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: .55rem 1rem; padding-top: .65rem; border-top: 1px solid var(--border); }
+  .group-option { display: inline-flex; align-items: center; gap: .45rem; cursor: pointer; }
+  .doubles-config { grid-column: 1 / -1; padding-top: .25rem; }
+  .doubles-config[hidden] { display: none; }
+  .team-list { display: grid; gap: .45rem; }
+  .team-row { display: grid; grid-template-columns: 64px minmax(0, 1fr) 18px minmax(0, 1fr) 36px; gap: .45rem; align-items: center; }
+  .team-priority { display: inline-grid; grid-template-columns: 26px 26px; gap: .2rem; justify-content: start; }
+  .team-priority .priority-number { text-align: center; }
+  .team-priority .btn-move { width: 26px; height: 26px; }
+  .team-plus { color: var(--muted); text-align: center; font-weight: 700; }
+  .btn-add-team { margin-top: .6rem; padding: .4rem .7rem; background: var(--accent-soft); color: #b6478f; }
   .btn-reset-state { width: 36px; height: 36px; padding: 0; background: var(--accent-soft); color: #b6478f; font-size: 1.15rem; }
   .btn-save { background: var(--grad); color: #fff; box-shadow: 0 6px 18px rgba(197, 111, 206, .38); }
   .btn-test { background: #fff; color: #c56fce; border: 1.5px solid #eccbe6; }
@@ -1900,6 +2619,34 @@ function renderRosterPage(
   .live-player-table td, .live-player-table th { padding: .38rem .4rem; }
   .live-player-error { color: #a9434b; font-size: .78rem; overflow-wrap: anywhere; }
   .status-error { margin-top: 1rem; color: #a9434b; background: #fdebed; border: 1px solid #f3c8cc; border-radius: 8px; padding: .65rem .8rem; }
+  .operation-logs { margin: 0 0 2rem; padding: 0 0 1.4rem; border-bottom: 1px solid var(--border); }
+  .log-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; }
+  .log-head h2 { margin: 0; }
+  .log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-top: .8rem; }
+  .log-modes { display: inline-flex; min-width: 0; border: 1px solid var(--field-border); border-radius: 8px; overflow: hidden; background: #fff; }
+  .log-mode { min-height: 38px; padding: .4rem .7rem; border-radius: 0; border-right: 1px solid var(--field-border); background: #fff; color: var(--muted); white-space: nowrap; box-shadow: none; }
+  .log-mode:last-child { border-right: 0; }
+  .log-mode.is-active { background: var(--accent-soft); color: #a9387e; }
+  .log-controls { display: flex; gap: .5rem; align-items: center; }
+  .log-auto { min-height: 38px; display: inline-flex; align-items: center; gap: .4rem; padding: .35rem .55rem; color: var(--muted); white-space: nowrap; cursor: pointer; }
+  .log-list { margin-top: .8rem; border-top: 1px solid var(--border); }
+  .log-empty { color: var(--muted); padding: 1rem 0; }
+  .log-run { border-bottom: 1px solid var(--border); }
+  .log-run > summary { list-style: none; display: grid; grid-template-columns: 9px minmax(0, 1fr) auto; gap: .65rem; align-items: center; padding: .75rem .15rem; cursor: pointer; }
+  .log-run > summary::-webkit-details-marker { display: none; }
+  .log-run-title { min-width: 0; font-weight: 700; overflow-wrap: anywhere; }
+  .log-run-meta { color: var(--muted); font-size: .78rem; font-weight: 400; }
+  .log-run-count { color: var(--muted); font-size: .78rem; white-space: nowrap; }
+  .log-entries { padding: 0 0 .7rem 1rem; border-left: 1px solid var(--border); margin-left: .4rem; }
+  .log-entry { display: grid; grid-template-columns: 72px 9px minmax(0, 1fr); gap: .55rem; align-items: start; padding: .45rem 0; }
+  .log-time { color: var(--muted); font: .75rem/1.4 ui-monospace, Menlo, monospace; }
+  .log-entry-main { min-width: 0; }
+  .log-action { font-size: .84rem; font-weight: 700; overflow-wrap: anywhere; }
+  .log-summary { color: var(--muted); font-size: .78rem; overflow-wrap: anywhere; }
+  .log-technical { margin-top: .25rem; }
+  .log-technical summary { color: var(--accent); cursor: pointer; font-size: .75rem; }
+  .log-technical pre { margin: .3rem 0 0; padding: .55rem .65rem; font-size: .72rem; max-height: 220px; overflow: auto; }
+  .log-load-error { color: #a9434b; padding: .8rem 0; }
   .browser-history { margin-top: .8rem; }
   .browser-history summary { cursor: pointer; color: var(--accent); font-weight: 650; }
   .browser-history table { margin-top: .5rem; }
@@ -1938,6 +2685,21 @@ function renderRosterPage(
     .status-metric:nth-child(2) { border-right: 0; }
     .status-metric:nth-child(-n+2) { border-bottom: 1px solid var(--border); }
     .live-group-head { flex-direction: column; gap: .25rem; }
+    .group-row { grid-template-columns: minmax(0, 1fr) 36px 36px; }
+    .group-row [data-group-id] { grid-column: 1 / -1; }
+    .group-enabled { grid-column: 1; }
+    .team-row { grid-template-columns: 58px minmax(0, 1fr) 18px minmax(0, 1fr) 32px; }
+    .log-head { align-items: stretch; flex-direction: column; }
+    .log-toolbar { align-items: stretch; flex-direction: column; }
+    .log-modes { display: grid; grid-template-columns: 1fr 1fr; width: 100%; }
+    .log-mode { border-bottom: 1px solid var(--field-border); }
+    .log-mode:nth-child(2) { border-right: 0; }
+    .log-mode:nth-child(n+3) { border-bottom: 0; }
+    .log-controls { display: grid; grid-template-columns: 1fr 1fr; }
+    .log-controls > * { min-width: 0; width: 100%; }
+    .log-run > summary { grid-template-columns: 9px minmax(0, 1fr); }
+    .log-run-count { grid-column: 2; }
+    .log-entry { grid-template-columns: 58px 9px minmax(0, 1fr); }
   }
 </style>
 </head>
@@ -1968,6 +2730,29 @@ function renderRosterPage(
       </div>
     </details>
     <div class="status-error" id="statusLoadError" hidden></div>
+  </section>
+
+  <section class="operation-logs" aria-labelledby="operationLogsTitle">
+    <div class="log-head">
+      <div>
+        <h2 id="operationLogsTitle">Журнал работы</h2>
+        <div class="status-updated" id="logsUpdated">Загружаю последние шаги…</div>
+      </div>
+    </div>
+    <div class="log-toolbar">
+      <div class="log-modes" role="group" aria-label="Режим журнала">
+        <button class="log-mode is-active" type="button" data-log-view="join" aria-pressed="true">Запись игроков</button>
+        <button class="log-mode" type="button" data-log-view="problems" aria-pressed="false">Проблемы</button>
+        <button class="log-mode" type="button" data-log-view="events" aria-pressed="false">События</button>
+        <button class="log-mode" type="button" data-log-view="all" aria-pressed="false">Все проверки</button>
+      </div>
+      <div class="log-controls">
+        <label class="log-auto"><input type="checkbox" id="logsAutoRefresh" checked>Авто</label>
+        <button class="btn-refresh" id="refreshLogs" type="button">↻ Обновить</button>
+      </div>
+    </div>
+    <div class="log-list" id="operationLogs"></div>
+    <div class="log-load-error" id="logsLoadError" hidden></div>
   </section>
 
   <div class="table-scroll">
@@ -2046,6 +2831,127 @@ const liveGroupsEl = document.getElementById("liveGroups");
 const browserHistoryEl = document.getElementById("browserHistory");
 const browserRunsEl = document.getElementById("browserRuns");
 const statusLoadErrorEl = document.getElementById("statusLoadError");
+const operationLogsEl = document.getElementById("operationLogs");
+const logsUpdatedEl = document.getElementById("logsUpdated");
+const logsLoadErrorEl = document.getElementById("logsLoadError");
+const refreshLogsEl = document.getElementById("refreshLogs");
+const logsAutoRefreshEl = document.getElementById("logsAutoRefresh");
+const logModeEls = Array.from(document.querySelectorAll("[data-log-view]"));
+let operationLogs = [];
+let activeLogView = "join";
+const openLogRunIdsByView = new Map();
+const openLogEntryIds = new Set();
+const initializedLogViews = new Set();
+
+function openLogRunIds() {
+  if (!openLogRunIdsByView.has(activeLogView)) {
+    openLogRunIdsByView.set(activeLogView, new Set());
+  }
+  return openLogRunIdsByView.get(activeLogView);
+}
+
+const LOG_ACTION_LABELS = {
+  cron_started: "Cron запущен",
+  cron_finished: "Cron завершён",
+  cron_failed: "Cron завершился с ошибкой",
+  cron_skipped: "Cron пропущен",
+  monitor_polling_healthy: "Мониторинг работает",
+  monitor_polling_skipped: "Мониторинг пропущен",
+  monitor_check_started: "Начата проверка события",
+  monitor_check_finished: "Проверка события завершена",
+  monitor_check_failed: "Проверка события завершилась с ошибкой",
+  monitor_scheduler_kick_failed: "Планировщик мониторинга недоступен",
+  group_checks_started: "Начата проверка групп",
+  group_check_finished: "Группа проверена",
+  group_check_failed: "Проверка группы не удалась",
+  event_notification_evaluated: "Проверено изменение событий",
+  autojoin_event_selected: "Выбрано событие для автозаписи",
+  autojoin_skipped: "Автозапись пропущена",
+  autojoin_failed: "Автозапись завершилась с ошибкой",
+  autojoin_completed: "Автозапись завершена",
+  autojoin_waiting_for_participants: "Ожидаем нужное число участников",
+  autojoin_waiting_for_date: "Ожидаем дату найденного события",
+  copy_discovery_finished: "Поиск копий событий завершён",
+  copy_discovery_failed: "Не удалось проверить копии событий",
+  autojoin_participation_check_failed: "Не удалось проверить число участников",
+  join_coordinator_prepared: "Очередь события подготовлена",
+  join_coordinator_prepare_failed: "Не удалось подготовить очередь",
+  join_person_started: "Начата запись игрока",
+  join_person_finished: "Запись игрока завершена",
+  racket_auth_started: "Начата авторизация Racket",
+  racket_auth_finished: "Авторизация Racket завершена",
+  racket_partner_auth_started: "Начата авторизация партнёра",
+  racket_partner_auth_finished: "Авторизация партнёра завершена",
+  participation_precheck_started: "Проверяется текущая запись",
+  participation_precheck_finished: "Текущая запись проверена",
+  firestore_join_attempt: "Запрос записи в Firestore",
+  firestore_team_join_attempt: "Запрос записи пары в Firestore",
+  participation_verification_started: "Проверяется результат PATCH",
+  participation_verification_finished: "Результат PATCH проверен",
+  api_path_failed: "API-путь завершился с ошибкой",
+  browser_fallback_started: "Запущен browser fallback",
+  browser_acquired: "Browser Run получен",
+  browser_acquisition_failed: "Browser Run недоступен",
+  browser_context_created: "Создан изолированный browser context",
+  browser_page_created: "Создана страница браузера",
+  browser_navigation_started: "Открывается страница группы",
+  browser_navigation_finished: "Страница группы открыта",
+  browser_login_button_clicked: "Нажата кнопка Log in to join",
+  browser_login_form_filled: "Форма логина заполнена",
+  browser_login_submitted: "Форма логина отправлена",
+  browser_login_finished: "Браузерная авторизация завершена",
+  browser_event_opened: "Карточка события открыта",
+  browser_participation_precheck: "Список игроков проверен в браузере",
+  browser_capacity_checked: "Вместимость события проверена",
+  browser_join_clicked: "Нажата кнопка Join",
+  browser_checkout_confirmation: "Checkout подтверждён",
+  browser_final_verification: "Браузерная запись проверена",
+  browser_context_closed: "Browser context закрыт",
+  browser_step_failed: "Шаг браузера завершился с ошибкой",
+  join_batch_finished: "Очередь игроков завершена",
+  telegram_notification_started: "Отправляется Telegram-сообщение",
+  telegram_notification_finished: "Telegram-сообщение отправлено",
+  telegram_notification_failed: "Telegram-сообщение не отправлено",
+  telegram_notification_skipped: "Telegram-сообщение пропущено",
+  settings_saved: "Настройки сохранены",
+  manual_join_started: "Ручная запись запущена",
+  manual_join_failed: "Ручная запись завершилась с ошибкой",
+  manual_group_check_started: "Ручная проверка запущена",
+  manual_group_check_finished: "Ручная проверка завершена",
+  status_snapshot: "Состояние приложения обновлено",
+  status_snapshot_failed: "Не удалось обновить состояние",
+};
+
+const LOG_DETAIL_LABELS = {
+  groupId: "группа",
+  eventId: "событие",
+  eventTitle: "ивент",
+  name: "игрок",
+  phase: "этап",
+  route: "путь",
+  outcome: "результат",
+  status: "статус",
+  coordinatorStatus: "очередь",
+  readStatus: "GET",
+  writeStatus: "PATCH",
+  attempt: "попытка",
+  joined: "записан",
+  joinedCount: "записано",
+  totalCount: "всего",
+  playerCount: "игроков",
+  partnerMode: "партнёр",
+  partnerName: "имя партнёра",
+  teamId: "пара",
+  eventCount: "событий",
+  durationMs: "время",
+  readDurationMs: "GET время",
+  writeDurationMs: "PATCH время",
+  verificationDurationMs: "проверка",
+  apiPathDurationMs: "API время",
+  intervalMs: "интервал",
+  reason: "причина",
+  error: "ошибка",
+};
 
 const PLAYER_STATUS_LABELS = {
   registered: "Записан",
@@ -2073,6 +2979,158 @@ function formatLisbonDate(value) {
     dateStyle: "short",
     timeStyle: "medium",
   });
+}
+
+function formatLogValue(key, value) {
+  if (value == null) return "—";
+  if (/(?:DurationMs$|^durationMs$|^intervalMs$)/.test(key) && typeof value === "number") {
+    return value >= 1000 ? (value / 1000).toFixed(1) + " с" : value + " мс";
+  }
+  if (typeof value === "boolean") return value ? "да" : "нет";
+  if (Array.isArray(value)) return value.join(", ");
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+}
+
+function conciseLogDetails(details) {
+  const keys = [
+    "groupId", "eventTitle", "eventId", "name", "phase", "route", "outcome",
+    "status", "coordinatorStatus", "attempt", "readStatus", "writeStatus",
+    "joined", "joinedCount", "totalCount", "playerCount", "eventCount",
+    "registeredCount", "minParticipants", "preparingEventIds", "copyQueryCount",
+    "durationMs", "readDurationMs", "writeDurationMs", "verificationDurationMs",
+    "apiPathDurationMs", "reason", "error",
+  ];
+  return keys
+    .filter((key) => details[key] !== undefined)
+    .map((key) => (LOG_DETAIL_LABELS[key] || key) + ": " + formatLogValue(key, details[key]))
+    .join(" · ");
+}
+
+function logRunTitle(entries) {
+  const selected = entries.find((entry) => entry.action === "autojoin_event_selected");
+  const completed = entries.find((entry) => entry.action === "autojoin_completed");
+  const failed = entries.find((entry) => entry.level === "error");
+  if (failed) return "Проблема: " + (LOG_ACTION_LABELS[failed.action] || failed.action);
+  if (completed) return "Автозапись успешно завершена";
+  if (selected) return "Обработка события " + (selected.details.eventTitle || selected.details.eventId || "");
+  const trigger = entries[0]?.trigger || "запуск";
+  if (trigger === "cron") return "Плановая проверка";
+  if (trigger === "alarm-10s") return "Быстрая проверка (10 секунд)";
+  if (trigger === "discovery-minute") return "Поиск новых событий (раз в минуту)";
+  if (trigger === "cron-watchdog") return "Контрольная проверка";
+  if (trigger === "/status") return "Обновление состояния";
+  if (trigger === "/join-test") return "Тестовая запись";
+  if (trigger === "/join") return "Ручная запись";
+  return trigger;
+}
+
+function renderOperationLogs() {
+  const runs = new Map();
+  operationLogs.forEach((entry) => {
+    const id = entry.runId || entry.id;
+    if (!runs.has(id)) runs.set(id, []);
+    runs.get(id).push(entry);
+  });
+
+  if (!runs.size) {
+    const emptyMessages = {
+      join: "Попыток записи игроков в сохранённом журнале нет.",
+      problems: "Ошибок и предупреждений в сохранённом журнале нет.",
+      events: "Появлений событий в сохранённом журнале нет.",
+      all: "Журнал пока пуст.",
+    };
+    operationLogsEl.innerHTML = '<div class="log-empty">' +
+      escapeHtml(emptyMessages[activeLogView] || emptyMessages.all) + '</div>';
+    return;
+  }
+
+  const expandedRunIds = openLogRunIds();
+  if (!initializedLogViews.has(activeLogView)) {
+    expandedRunIds.add(String(runs.keys().next().value));
+    initializedLogViews.add(activeLogView);
+  }
+
+  operationLogsEl.innerHTML = Array.from(runs.entries()).map(([runId, entries], runIndex) => {
+    const chronologicalEntries = entries.slice().sort((a, b) =>
+      (a.sequence || 0) - (b.sequence || 0) ||
+      new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+    );
+    const tone = entries.some((entry) => entry.level === "error")
+      ? "is-bad"
+      : entries.some((entry) => entry.level === "warn") ? "is-warn" : "is-good";
+    const newest = new Date(chronologicalEntries[chronologicalEntries.length - 1].timestamp);
+    const oldest = new Date(chronologicalEntries[0].timestamp);
+    const elapsed = Math.max(0, newest.getTime() - oldest.getTime());
+    const runMeta = formatLisbonDate(oldest.toISOString()) +
+      " · " + (entries[0].trigger || "—") +
+      (elapsed ? " · " + formatLogValue("durationMs", elapsed) : "") +
+      " · " + String(runId).slice(0, 24);
+    const entryMarkup = chronologicalEntries.map((entry) => {
+      const summary = conciseLogDetails(entry.details || {});
+      const technical = escapeHtml(JSON.stringify(entry.details || {}, null, 2));
+      const entryId = String(entry.id || "");
+      return '<div class="log-entry"><div class="log-time">' +
+        escapeHtml(new Date(entry.timestamp).toLocaleTimeString("ru-RU", { timeZone: "Europe/Lisbon" })) +
+        '</div><span class="status-dot ' +
+        (entry.level === "error" ? "is-bad" : entry.level === "warn" ? "is-warn" : "is-good") +
+        '"></span><div class="log-entry-main"><div class="log-action">' +
+        escapeHtml(LOG_ACTION_LABELS[entry.action] || entry.action) +
+        '</div>' + (summary ? '<div class="log-summary">' + escapeHtml(summary) + '</div>' : '') +
+        '<details class="log-technical" data-log-entry-id="' + escapeHtml(entryId) + '"' +
+        (openLogEntryIds.has(entryId) ? ' open' : '') +
+        '><summary>Технические данные</summary><pre>' + technical +
+        '</pre></details></div></div>';
+    }).join("");
+    const normalizedRunId = String(runId);
+    return '<details class="log-run" data-log-run-id="' + escapeHtml(normalizedRunId) + '"' +
+      (expandedRunIds.has(normalizedRunId) ? " open" : "") +
+      '><summary><span class="status-dot ' + tone + '"></span><div><div class="log-run-title">' +
+      escapeHtml(logRunTitle(entries)) + '</div><div class="log-run-meta">' + escapeHtml(runMeta) +
+      '</div></div><span class="log-run-count">' + entries.length + ' шагов</span></summary>' +
+      '<div class="log-entries">' + entryMarkup + '</div></details>';
+  }).join("");
+}
+
+operationLogsEl.addEventListener("toggle", (event) => {
+  const details = event.target;
+  if (!details || details.tagName !== "DETAILS") return;
+  if (details.classList.contains("log-run")) {
+    const runId = details.dataset.logRunId;
+    if (!runId) return;
+    if (details.open) openLogRunIds().add(runId);
+    else openLogRunIds().delete(runId);
+  }
+  if (details.classList.contains("log-technical")) {
+    const entryId = details.dataset.logEntryId;
+    if (!entryId) return;
+    if (details.open) openLogEntryIds.add(entryId);
+    else openLogEntryIds.delete(entryId);
+  }
+}, true);
+
+async function refreshOperationLogs() {
+  refreshLogsEl.disabled = true;
+  logsLoadErrorEl.hidden = true;
+  try {
+    const response = await fetch("/logs?secret=" + encodeURIComponent(SECRET) +
+      "&limit=1000&view=" + encodeURIComponent(activeLogView), {
+      headers: { "cache-control": "no-cache" },
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || ("HTTP " + response.status));
+    operationLogs = data.logs || [];
+    logsUpdatedEl.textContent = "Обновлено " + formatLisbonDate(new Date().toISOString()) +
+      " · найдено запусков: " + data.matchedRunCount +
+      " · шагов: " + operationLogs.length;
+    renderOperationLogs();
+  } catch (error) {
+    logsUpdatedEl.textContent = "Не удалось загрузить журнал";
+    logsLoadErrorEl.hidden = false;
+    logsLoadErrorEl.textContent = String(error);
+  } finally {
+    refreshLogsEl.disabled = false;
+  }
 }
 
 function setStatusMetric(index, text, tone) {
@@ -2159,8 +3217,19 @@ function getGroupRuntimeSummary(groupStatus, groupEnabled, monitorState) {
     player.status === "registered" || player.status === "reserve"
   );
   const pendingCount = activePlayers.length - joinedPlayers.length;
-  const queueStarted = groupStatus.activeEventId === groupStatus.event.id;
+  const queueStarted = groupStatus.hasStartedAutoJoin;
   const eventName = groupStatus.event.title || groupStatus.event.date || groupStatus.event.id;
+  const minimum = groupStatus.minParticipants ?? 10;
+  if (!queueStarted && pendingCount && groupStatus.event.registeredCount != null &&
+      groupStatus.event.registeredCount < minimum) {
+    return {
+      ...state,
+      details: eventName + ": участников " + groupStatus.event.registeredCount +
+        "/" + minimum + ". Резерв не учитывается. Проверяем каждые 10 секунд по расписанию.",
+      badge: "Ждём участников",
+      badgeClass: "reserve",
+    };
+  }
   if (!activePlayers.length) {
     return {
       ...state,
@@ -2276,7 +3345,7 @@ function renderApplicationStatus(data) {
           ' · игроков ' + escapeHtml(event.registeredCount == null ? "?" : event.registeredCount) +
           '/' + escapeHtml(event.slots == null ? "?" : event.slots) +
           ' · резерв ' + escapeHtml(event.reserveCount == null ? "?" : event.reserveCount) +
-          ' · ' + (group.activeEventId === event.id ? "очередь автозаписи уже запускалась" : "cron ещё не запускал автозапись") +
+          ' · ' + (group.hasStartedAutoJoin ? "очередь автозаписи уже запускалась" : "cron ещё не запускал автозапись") +
           '</div></div>'
         : '<div class="event-line live-group-meta">Подходящих событий сейчас нет.</div>';
       const playerRows = group.players.map((player) =>
@@ -2332,6 +3401,23 @@ async function refreshApplicationStatus() {
 }
 
 refreshStatusEl.addEventListener("click", refreshApplicationStatus);
+refreshLogsEl.addEventListener("click", refreshOperationLogs);
+logModeEls.forEach((button) => {
+  button.addEventListener("click", () => {
+    activeLogView = button.dataset.logView;
+    logModeEls.forEach((item) => {
+      const active = item === button;
+      item.classList.toggle("is-active", active);
+      item.setAttribute("aria-pressed", String(active));
+    });
+    refreshOperationLogs();
+  });
+});
+window.setInterval(() => {
+  if (logsAutoRefreshEl.checked && document.visibilityState === "visible") {
+    refreshOperationLogs();
+  }
+}, 10000);
 
 function renderGroups() {
   groupsEl.innerHTML = "";
@@ -2347,12 +3433,55 @@ function renderGroups() {
         '<span class="status-dot"></span><div class="group-runtime-text">' +
           '<div class="group-runtime-title">Проверяю состояние…</div>' +
           '<div class="group-runtime-details">Жду актуальные данные приложения.</div>' +
-        '</div></div>';
+        '</div></div>' +
+      '<div class="group-options">' +
+        '<label class="group-option"><input type="checkbox" data-group-singles="' + i + '">Обычные события</label>' +
+        '<label class="group-option"><input type="checkbox" data-group-doubles="' + i + '">Парные события</label>' +
+        '<label class="group-option">Записывать при <input type="number" min="0" max="10000" step="1" data-group-min-participants="' + i + '" aria-label="Минимум участников для автозаписи" style="width:5rem"> участниках</label>' +
+        '<span class="hint">Без резерва. 0 — записывать сразу.</span>' +
+      '</div>' +
+      '<div class="doubles-config" data-doubles-config="' + i + '">' +
+        '<div class="team-list" data-team-list="' + i + '"></div>' +
+        '<button class="btn-add-team" type="button" data-add-team="' + i + '">+ Добавить пару</button>' +
+      '</div>';
     row.querySelector("[data-group-id]").value = group.id;
     row.querySelector("[data-group-enabled]").checked = group.enabled !== false;
+    row.querySelector("[data-group-singles]").checked = group.joinSingles !== false;
+    row.querySelector("[data-group-doubles]").checked = group.joinDoubles === true;
+    row.querySelector("[data-group-min-participants]").value = group.minParticipants ?? 10;
+    row.querySelector("[data-doubles-config]").hidden = group.joinDoubles !== true;
     groupsEl.appendChild(row);
+    renderDoublesTeams(row, group, i);
   });
   renderGroupRuntimeStates();
+}
+
+function personOptions(selectedId, includePlaceholder) {
+  let options = includePlaceholder
+    ? '<option value="">Placeholder — партнёр пока неизвестен</option>'
+    : '<option value="">Выберите игрока</option>';
+  options += people.map((person) =>
+    '<option value="' + escapeHtml(person.id) + '"' +
+      (person.id === selectedId ? ' selected' : '') + '>' +
+      escapeHtml(person.name || person.email) + '</option>'
+  ).join("");
+  return options;
+}
+
+function renderDoublesTeams(row, group, groupIndex) {
+  const list = row.querySelector("[data-team-list]");
+  const teams = group.doublesTeams || [];
+  list.innerHTML = teams.length ? teams.map((team, teamIndex) =>
+    '<div class="team-row" data-team-row="' + teamIndex + '" data-team-id="' + escapeHtml(team.id) + '">' +
+      '<div class="team-priority"><span class="priority-number">№ ' + (teamIndex + 1) + '</span>' +
+        '<button class="btn-move" type="button" data-move-team="up" data-group-index="' + groupIndex + '" data-team-index="' + teamIndex + '"' + (teamIndex === 0 ? ' disabled' : '') + ' aria-label="Поднять пару">↑</button>' +
+        '<button class="btn-move" type="button" data-move-team="down" data-group-index="' + groupIndex + '" data-team-index="' + teamIndex + '"' + (teamIndex === teams.length - 1 ? ' disabled' : '') + ' aria-label="Опустить пару">↓</button></div>' +
+      '<select data-team-leader aria-label="Кто выполняет запись">' + personOptions(team.leaderId, false) + '</select>' +
+      '<span class="team-plus">+</span>' +
+      '<select data-team-partner aria-label="Партнёр">' + personOptions(team.partnerId || "", true) + '</select>' +
+      '<button class="btn-remove" type="button" data-remove-team="' + teamIndex + '" data-group-index="' + groupIndex + '" aria-label="Удалить пару">×</button>' +
+    '</div>'
+  ).join("") : '<div class="group-runtime-details">Добавьте хотя бы одну пару. Верхняя записывается первой.</div>';
 }
 
 function collectGroups() {
@@ -2360,6 +3489,15 @@ function collectGroups() {
     .map((row) => ({
       id: row.querySelector("[data-group-id]").value.trim(),
       enabled: row.querySelector("[data-group-enabled]").checked,
+      joinSingles: row.querySelector("[data-group-singles]").checked,
+      joinDoubles: row.querySelector("[data-group-doubles]").checked,
+      minParticipants: Number(row.querySelector("[data-group-min-participants]").value),
+      doublesTeams: Array.from(row.querySelectorAll("[data-team-row]")).map((teamRow) => ({
+        id: teamRow.dataset.teamId || crypto.randomUUID(),
+        leaderId: teamRow.querySelector("[data-team-leader]").value,
+        partnerId: teamRow.querySelector("[data-team-partner]").value || null,
+        enabled: true,
+      })),
     }))
     .filter((group) => group.id);
 }
@@ -2485,6 +3623,52 @@ document.getElementById("add").addEventListener("click", () => {
 });
 
 groupsEl.addEventListener("click", (e) => {
+  const addTeamButton = e.target.closest("[data-add-team]");
+  if (addTeamButton) {
+    collectGroups();
+    const groupIndex = Number(addTeamButton.dataset.addTeam);
+    const group = groups[groupIndex];
+    if (!group) return;
+    const usedIds = new Set(
+      group.doublesTeams.flatMap((team) =>
+        [team.leaderId, team.partnerId].filter(Boolean)
+      ),
+    );
+    const leader = people.find((person) => person.enabled && !usedIds.has(person.id)) ||
+      people.find((person) => person.enabled) || people[0];
+    group.doublesTeams.push({
+      id: crypto.randomUUID(),
+      leaderId: leader?.id || "",
+      partnerId: null,
+      enabled: true,
+    });
+    renderGroups();
+    return;
+  }
+
+  const moveTeamButton = e.target.closest("[data-move-team]");
+  if (moveTeamButton) {
+    collectGroups();
+    const groupIndex = Number(moveTeamButton.dataset.groupIndex);
+    const teamIndex = Number(moveTeamButton.dataset.teamIndex);
+    const direction = moveTeamButton.dataset.moveTeam === "up" ? -1 : 1;
+    const targetIndex = teamIndex + direction;
+    const teams = groups[groupIndex]?.doublesTeams;
+    if (!teams || targetIndex < 0 || targetIndex >= teams.length) return;
+    [teams[teamIndex], teams[targetIndex]] = [teams[targetIndex], teams[teamIndex]];
+    renderGroups();
+    return;
+  }
+
+  const removeTeamButton = e.target.closest("[data-remove-team]");
+  if (removeTeamButton) {
+    collectGroups();
+    const groupIndex = Number(removeTeamButton.dataset.groupIndex);
+    groups[groupIndex]?.doublesTeams.splice(Number(removeTeamButton.dataset.removeTeam), 1);
+    renderGroups();
+    return;
+  }
+
   const resetButton = e.target.closest("[data-reset-group]");
   if (resetButton) {
     collectGroups();
@@ -2519,9 +3703,26 @@ groupsEl.addEventListener("click", (e) => {
   renderGroups();
 });
 
+groupsEl.addEventListener("change", (e) => {
+  const teamSelect = e.target.closest("[data-team-leader], [data-team-partner]");
+  if (teamSelect) {
+    teamSelect.closest("[data-team-row]").dataset.teamId = crypto.randomUUID();
+  }
+  const doublesToggle = e.target.closest("[data-group-doubles]");
+  if (!doublesToggle) return;
+  const row = doublesToggle.closest(".group-row");
+  row.querySelector("[data-doubles-config]").hidden = !doublesToggle.checked;
+});
+
 document.getElementById("addGroup").addEventListener("click", () => {
   collectGroups();
-  groups.push({ id: "", enabled: true });
+  groups.push({
+    id: "",
+    enabled: true,
+    joinSingles: true,
+    joinDoubles: false,
+    doublesTeams: [],
+  });
   renderGroups();
   groupsEl.querySelector(".group-row:last-child [data-group-id]")?.focus();
 });
@@ -2596,6 +3797,7 @@ renderSchedule();
 renderGroups();
 renderPause();
 refreshApplicationStatus();
+refreshOperationLogs();
 </script>
 </body>
 </html>`;
@@ -2657,7 +3859,11 @@ async function sendTelegramPhoto(
   }
 }
 
-async function notifyIfEventsAppeared(env: Env, result: CheckResult): Promise<void> {
+async function notifyIfEventsAppeared(
+  env: Env,
+  result: CheckResult,
+  log: OperationalLogger,
+): Promise<void> {
   const stateKey = `${LAST_HAS_EVENTS_KEY}:${result.groupId}`;
   let previousValue = await env.MONITOR_STATE.get(stateKey);
   if (previousValue === null && result.groupId === fallbackGroupId(env)) {
@@ -2666,15 +3872,35 @@ async function notifyIfEventsAppeared(env: Env, result: CheckResult): Promise<vo
       await env.MONITOR_STATE.put(stateKey, previousValue);
     }
   }
-  const previousHasEvents = previousValue === "true";
-  const currentValue = String(result.hasEvents);
+  const currentValue = eventNotificationState(result.events);
   const stateChanged = previousValue !== currentValue;
+
+  log("event_notification_evaluated", {
+    groupId: result.groupId,
+    eventIds: result.events.map((event) => event.id),
+    stateChanged,
+    hasEvents: result.hasEvents,
+  });
 
   if (stateChanged) {
     await env.MONITOR_STATE.put(stateKey, currentValue);
   }
 
-  if (!result.hasEvents || previousHasEvents) {
+  if (!result.hasEvents || !stateChanged) {
+    log("telegram_notification_skipped", {
+      groupId: result.groupId,
+      reason: !result.hasEvents ? "No events." : "Event set did not change.",
+    });
+    return;
+  }
+
+  // Upgrade the old boolean state without sending a duplicate notification
+  // for events that were already announced before this deployment.
+  if (previousValue === "true") {
+    log("telegram_notification_skipped", {
+      groupId: result.groupId,
+      reason: "Migrated legacy boolean event state without duplicate notification.",
+    });
     return;
   }
 
@@ -2682,53 +3908,105 @@ async function notifyIfEventsAppeared(env: Env, result: CheckResult): Promise<vo
 
   if (!chatId) {
     console.log("Events appeared, but Telegram chat_id is not registered yet.");
+    log("telegram_notification_skipped", {
+      groupId: result.groupId,
+      reason: "Telegram chat ID is not configured.",
+    }, "warn");
     return;
   }
 
-  await sendTelegramMessage(
-    env,
-    chatId,
-    `События появились в группе ${result.groupId}.\n${result.groupUrl}`,
-  );
+  const startedAt = Date.now();
+  log("telegram_notification_started", {
+    groupId: result.groupId,
+    eventIds: result.events.map((event) => event.id),
+  });
+  try {
+    await sendTelegramMessage(
+      env,
+      chatId,
+      formatEventsTelegramMessage(result, result.groupConfig),
+    );
+    log("telegram_notification_finished", {
+      groupId: result.groupId,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    log("telegram_notification_failed", {
+      groupId: result.groupId,
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error),
+    }, "error");
+    throw error;
+  }
 }
 
-// Joins the first upcoming event through its per-event Durable Object. Concurrent
+// Joins one configured event through its per-event Durable Object. Concurrent
 // cron/manual calls return "busy" without launching another browser.
-async function autoJoinIfEventAppeared(
+async function autoJoinEvent(
   env: Env,
   targetGroupId: string,
   targetGroupUrl: string,
-  detectedEvents: EventSummary[],
-): Promise<void> {
-  const people = await getPeopleToJoin(env);
+  detectedEvent: EventSummary,
+  groupConfig: MonitoredGroup,
+  log: OperationalLogger,
+): Promise<AutoJoinStatus> {
+  const people = buildJoinCandidates(
+    await getRoster(env),
+    detectedEvent,
+    groupConfig,
+  );
   if (!people.length) {
-    return;
+    log("autojoin_skipped", {
+      groupId: targetGroupId,
+      eventId: detectedEvent.id,
+      reason: isDoublesEvent(detectedEvent)
+        ? "No valid enabled doubles teams are configured."
+        : "No enabled players with credentials.",
+    }, "warn");
+    return "terminal";
   }
 
-  const detectedEvent = pickJoinableEvent(detectedEvents);
-  if (!detectedEvent) {
-    return;
-  }
-
-  const activeEventKey = `${ACTIVE_JOIN_EVENT_KEY}:${targetGroupId}`;
-  const previousEventId = await env.MONITOR_STATE.get(activeEventKey);
-  if (previousEventId !== detectedEvent.id) {
-    const coordinatorId = env.JOIN_COORDINATOR.idFromName(detectedEvent.id);
-    const coordinator = new JoinCoordinatorClient(env.JOIN_COORDINATOR.get(coordinatorId));
-    try {
-      await coordinator.reset();
-      await env.MONITOR_STATE.put(activeEventKey, detectedEvent.id);
-      console.log(
-        `Prepared coordinator for event ${detectedEvent.id} in group ${targetGroupId}.`,
-      );
-    } catch (error) {
-      console.warn(
-        `Could not prepare coordinator for event ${detectedEvent.id}; retrying next cron:`,
-        error,
-      );
-      return;
+  try {
+    const minimum = normalizeMinParticipants(groupConfig.minParticipants);
+    const coordinator = new JoinCoordinatorClient(
+      env.JOIN_COORDINATOR.get(env.JOIN_COORDINATOR.idFromName(detectedEvent.id)),
+    );
+    const state = await coordinator.getState();
+    // Once a batch has started, a later departure must not prevent retries.
+    const started = Boolean(state.running) || state.joinedIds.length > 0 ||
+      Object.values(state.attemptsByPerson).some((attempts) => attempts > 0);
+    if (minimum > 0 && !started && !state.done) {
+      const participation = detectedEvent.registeredCount === undefined
+        ? await getEventParticipationSnapshot(detectedEvent.id)
+        : { registeredCount: detectedEvent.registeredCount, reserveCount: detectedEvent.reserveCount ?? 0 };
+      if (participation.registeredCount < minimum) {
+        log("autojoin_waiting_for_participants", {
+          groupId: targetGroupId,
+          eventId: detectedEvent.id,
+          registeredCount: participation.registeredCount,
+          reserveCount: participation.reserveCount,
+          minParticipants: minimum,
+          intervalMs: MONITOR_POLL_INTERVAL_MS,
+        });
+        return "retry";
+      }
     }
+  } catch (error) {
+    log("autojoin_participation_check_failed", {
+      groupId: targetGroupId,
+      eventId: detectedEvent.id,
+      error: error instanceof Error ? error.message : String(error),
+    }, "error");
+    return "retry";
   }
+
+  log("autojoin_event_selected", {
+    groupId: targetGroupId,
+    eventId: detectedEvent.id,
+    eventTitle: detectedEvent.title,
+    eventDate: detectedEvent.date,
+    playerCount: people.length,
+  });
 
   const chatId = await env.MONITOR_STATE.get(TELEGRAM_CHAT_ID_KEY);
   let outcome: Awaited<ReturnType<typeof joinFirstAvailableEvent>>;
@@ -2740,17 +4018,34 @@ async function autoJoinIfEventAppeared(
       targetGroupUrl,
       env,
       debugScreenshots,
+      false,
+      log,
+      detectedEvent,
+      groupConfig,
     );
   } catch (error) {
     console.error("Auto-join coordinator failed:", error);
-    return;
+    log("autojoin_failed", {
+      groupId: targetGroupId,
+      eventId: detectedEvent.id,
+      error: error instanceof Error ? error.message : String(error),
+    }, "error");
+    return "retry";
   }
 
   if (!("coordinatorStatus" in outcome) || !outcome.event) {
-    return;
+    return "retry";
   }
   if (outcome.coordinatorStatus === "busy" || outcome.coordinatorStatus === "complete") {
-    return;
+    log("autojoin_skipped", {
+      groupId: targetGroupId,
+      eventId: outcome.event.id,
+      reason: outcome.coordinatorStatus === "busy"
+        ? "Another invocation owns the event lease."
+        : "All enabled players are already complete.",
+      coordinatorStatus: outcome.coordinatorStatus,
+    });
+    return outcome.coordinatorStatus === "complete" ? "complete" : "retry";
   }
 
   const eventLabel = outcome.event.title || outcome.event.date || outcome.event.id;
@@ -2760,6 +4055,12 @@ async function autoJoinIfEventAppeared(
   if (outcome.completedNow) {
     const joinedNames = people.map((person) => person.name || person.email).join(", ");
     console.log(`Auto-join complete for ${outcome.event.id}: ${joinedNames}`);
+    log("autojoin_completed", {
+      groupId: targetGroupId,
+      eventId: outcome.event.id,
+      joinedCount: outcome.joinedCount,
+      totalCount: outcome.totalCount,
+    });
     if (chatId) {
       await sendTelegramMessage(
         env,
@@ -2767,7 +4068,7 @@ async function autoJoinIfEventAppeared(
         `✅ Записал на ивент ${eventLabel}: ${joinedNames}.\n${targetGroupUrl}`,
       );
     }
-    return;
+    return "complete";
   }
 
   const stillMissing = people.filter((person) => !joinedIds.includes(person.id));
@@ -2795,12 +4096,437 @@ async function autoJoinIfEventAppeared(
     const missingNames = stillMissing.map((person) => person.name || person.email).join(", ");
     const suffix = exhausted
       ? `Больше не пытаюсь после ${MAX_JOIN_ATTEMPTS} попыток на человека.`
-      : "Пробую ещё каждую минуту только для оставшихся.";
+      : "Продолжаю попытки только для оставшихся.";
     await sendTelegramMessage(
       env,
       chatId,
       `⚠️ Ивент ${eventLabel}: не записаны ${missingNames}. ${reason}\n${suffix} ${targetGroupUrl}`,
     );
+  }
+  return exhausted ? "terminal" : "retry";
+}
+
+async function autoJoinIfEventAppeared(
+  env: Env,
+  targetGroupId: string,
+  targetGroupUrl: string,
+  detectedEvents: EventSummary[],
+  groupConfig: MonitoredGroup,
+  log: OperationalLogger,
+  onEventStatus?: (event: EventSummary, status: AutoJoinStatus) => void,
+  preserveKnownEvents = false,
+): Promise<AutoJoinStatus> {
+  const events = detectedEvents.filter((event) =>
+    isEventEnabledForGroup(event, groupConfig)
+  );
+  if (!events.length) {
+    await saveActiveJoinEventIds(env, targetGroupId, []);
+    log("autojoin_skipped", {
+      groupId: targetGroupId,
+      eventIds: detectedEvents.map((event) => event.id),
+      reason: "All detected event types are disabled in group settings.",
+    });
+    return "terminal";
+  }
+
+  await saveActiveJoinEventIds(
+    env,
+    targetGroupId,
+    preserveKnownEvents
+      ? [...await getActiveJoinEventIds(env, targetGroupId), ...events.map((event) => event.id)]
+      : events.map((event) => event.id),
+  );
+
+  const statuses: AutoJoinStatus[] = [];
+  for (const event of events) {
+    const status = await autoJoinEvent(
+      env,
+      targetGroupId,
+      targetGroupUrl,
+      event,
+      groupConfig,
+      log,
+    );
+    statuses.push(status);
+    onEventStatus?.(event, status);
+  }
+  if (statuses.includes("retry")) return "retry";
+  return statuses.every((status) => status === "complete") ? "complete" : "terminal";
+}
+
+interface PendingMonitorEvent {
+  groupId: string;
+  event: EventSummary;
+}
+
+interface MonitorCheckOutcome {
+  pendingEvents: PendingMonitorEvent[];
+  copySeeds: CopySeedsByGroup;
+  groupCount: number;
+  eventCount: number;
+  hadErrors: boolean;
+}
+
+const noopOperationalLogger: OperationalLogger = () => undefined;
+
+async function executeMonitorCheck(
+  env: Env,
+  ctx: WaitUntilContext,
+  options: {
+    trigger: string;
+    scheduledTime: number;
+    persistRoutineLog: boolean;
+    discover: boolean;
+    pendingEvents: PendingMonitorEvent[];
+    copySeeds: CopySeedsByGroup;
+  },
+): Promise<MonitorCheckOutcome> {
+  const startedAt = Date.now();
+  const runId = `monitor-${options.scheduledTime}-${crypto.randomUUID().slice(0, 8)}`;
+  const groups = (await getMonitoredGroups(env)).filter((group) => group.enabled);
+  const copySeeds = { ...options.copySeeds };
+  const pending = new Map(options.pendingEvents
+    .filter((item) => groups.some((group) => group.id === item.groupId))
+    .map((item) => [`${item.groupId}:${item.event.id}`, item]));
+  const results: CheckResult[] = options.discover
+    ? await checkMonitoredGroupEvents(env, groups)
+    : await Promise.all(groups.filter((group) =>
+      Array.from(pending.values()).some((item) => item.groupId === group.id)
+    ).map(async (group): Promise<CheckResult> => {
+      const base = {
+        checkedAt: new Date().toISOString(),
+        groupId: group.id,
+        groupUrl: groupUrl(group.id),
+        groupConfig: group,
+        source: "firestore" as const,
+      };
+      try {
+        const events = (await Promise.all(Array.from(pending.values())
+          .filter((item) => item.groupId === group.id)
+          .map((item) => readKnownEvent(group.id, item.event.id))))
+          .filter((event) => event !== null);
+        const ready = events.filter((event) => event.date);
+        return { ...base, ok: true, events: ready, preparingEvents: events.filter((event) => !event.date),
+          hasEvents: ready.length > 0,
+          emptyStateTextFound: !ready.length, visibleTextPreview: "Known events read directly by ID." };
+      } catch (error) {
+        return { ...base, ok: false, events: [], hasEvents: false,
+          emptyStateTextFound: false, visibleTextPreview: "Known event read failed.",
+          error: error instanceof Error ? error.message : String(error) };
+      }
+    }));
+  if (options.discover) {
+    await Promise.all(results.filter((result) => result.ok).map(async (result) => {
+      const candidates = new Map(result.events.map((event) => [event.id, event]));
+      try {
+        const discovered = await discoverEventCopies(result.groupId, copySeeds[result.groupId] || [],
+          getLisbonDateTimeString());
+        copySeeds[result.groupId] = discovered.seeds;
+        result.copyQueryCount = discovered.copyQueryCount;
+        for (const event of discovered.candidates) {
+          if (!candidates.has(event.id)) candidates.set(event.id, event);
+        }
+      } catch (error) {
+        result.copyDiscoveryError = error instanceof Error ? error.message : String(error);
+      }
+      // Keep undated candidates from the durable queue even when they no longer
+      // appear in the parent queries or discovery temporarily fails.
+      for (const item of pending.values()) {
+        if (item.groupId !== result.groupId || candidates.has(item.event.id)) continue;
+        try {
+          const event = await readKnownEvent(result.groupId, item.event.id);
+          if (event) candidates.set(event.id, event);
+        } catch (error) {
+          result.copyDiscoveryError = error instanceof Error ? error.message : String(error);
+        }
+      }
+      result.events = Array.from(candidates.values()).filter((event) => event.date)
+        .sort((a, b) => a.date!.localeCompare(b.date!));
+      result.preparingEvents = Array.from(candidates.values()).filter((event) => !event.date);
+      result.hasEvents = result.events.length > 0;
+      result.emptyStateTextFound = !result.hasEvents;
+    }));
+  }
+  const hadErrors = results.some((result) => !result.ok || result.copyDiscoveryError);
+  const eventCount = results.reduce((count, result) => count + result.events.length, 0);
+  const preparingCount = results.reduce((count, result) => count + (result.preparingEvents?.length || 0), 0);
+  const interesting = hadErrors || eventCount > 0 || preparingCount > 0;
+  const log = interesting || options.persistRoutineLog
+    ? createOperationalLogger(env, ctx, { runId, trigger: options.trigger })
+    : noopOperationalLogger;
+
+  if (!results.length) {
+    if (options.persistRoutineLog) {
+      log("monitor_polling_skipped", {
+        reason: "No enabled monitored groups configured.",
+        intervalMs: MONITOR_POLL_INTERVAL_MS,
+      }, "warn");
+    }
+    return {
+      pendingEvents: [],
+      copySeeds,
+      groupCount: 0,
+      eventCount: 0,
+      hadErrors: false,
+    };
+  }
+
+  if (!interesting) {
+    for (const result of results) {
+      await notifyIfEventsAppeared(env, result, noopOperationalLogger);
+    }
+    if (options.persistRoutineLog) {
+      log("monitor_polling_healthy", {
+        groupCount: results.length,
+        intervalMs: options.discover ? MONITOR_DISCOVERY_INTERVAL_MS : MONITOR_POLL_INTERVAL_MS,
+        durationMs: Date.now() - startedAt,
+      });
+    }
+    console.log(`No Racket events found in ${results.length} monitored group(s).`);
+    return {
+      pendingEvents: [],
+      copySeeds,
+      groupCount: results.length,
+      eventCount: 0,
+      hadErrors: false,
+    };
+  }
+
+  log("monitor_check_started", {
+    intervalMs: options.discover ? MONITOR_DISCOVERY_INTERVAL_MS : MONITOR_POLL_INTERVAL_MS,
+    discovery: options.discover,
+    scheduledTime: options.scheduledTime,
+  });
+  for (const result of results) {
+    if (!result.ok) {
+      log("group_check_failed", {
+        groupId: result.groupId,
+        error: result.error,
+      }, "error");
+      console.error(
+        `Racket event check failed for group ${result.groupId}: ${result.error || "unknown error"}`,
+      );
+      continue;
+    }
+
+    if (result.copyDiscoveryError) {
+      log("copy_discovery_failed", { groupId: result.groupId, error: result.copyDiscoveryError }, "error");
+    }
+    for (const [key, item] of pending) {
+      if (item.groupId === result.groupId && !result.copyDiscoveryError) pending.delete(key);
+    }
+
+    log("group_check_finished", {
+      groupId: result.groupId,
+      hasEvents: result.hasEvents,
+      eventCount: result.events.length,
+      durationMs: Date.now() - startedAt,
+    });
+    if (options.discover) await notifyIfEventsAppeared(env, result, log);
+
+    const groupConfig = result.groupConfig || {
+      id: result.groupId, enabled: true, joinSingles: true, joinDoubles: false, doublesTeams: [],
+    };
+    if (options.discover) log("copy_discovery_finished", {
+      groupId: result.groupId, seedCount: copySeeds[result.groupId]?.length || 0,
+      copyQueryCount: result.copyQueryCount, eventIds: result.events.map((event) => event.id),
+      preparingEventIds: result.preparingEvents?.map((event) => event.id) || [],
+    });
+    for (const event of result.preparingEvents || []) {
+      if (!isEventEnabledForGroup(event, groupConfig)) continue;
+      pending.set(`${result.groupId}:${event.id}`, { groupId: result.groupId, event });
+      log("autojoin_waiting_for_date", { groupId: result.groupId, eventId: event.id,
+        eventTitle: event.title, intervalMs: MONITOR_POLL_INTERVAL_MS });
+    }
+
+    if (!result.hasEvents) {
+      continue;
+    }
+
+    await autoJoinIfEventAppeared(
+      env,
+      result.groupId,
+      result.groupUrl,
+      result.events,
+      groupConfig,
+      log,
+      (event, status) => {
+        pending.delete(`${result.groupId}:${event.id}`);
+        if (status === "retry") pending.set(`${result.groupId}:${event.id}`, {
+          groupId: result.groupId, event,
+        });
+      },
+      !options.discover,
+    );
+  }
+
+  log("monitor_check_finished", {
+    groupCount: results.length,
+    eventCount,
+    pendingEventCount: pending.size,
+    durationMs: Date.now() - startedAt,
+  });
+  return {
+    pendingEvents: Array.from(pending.values()),
+    copySeeds,
+    groupCount: results.length,
+    eventCount,
+    hadErrors,
+  };
+}
+
+export class MonitorScheduler {
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Env,
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "GET") {
+      const schedule = await getSchedule(this.env);
+      const windowKey = monitoringWindowKey(schedule);
+      const [alarmAt, pending, lastDiscoveryAt] = await Promise.all([
+        this.state.storage.getAlarm(),
+        this.state.storage.get<PendingMonitorEvent[]>(MONITOR_PENDING_EVENTS_KEY),
+        this.state.storage.get<number>(MONITOR_LAST_DISCOVERY_KEY),
+      ]);
+      return jsonResponse({
+        active: Boolean(windowKey),
+        mode: !windowKey
+          ? "idle"
+          : pending?.length ? "10s" : "minute",
+        alarmAt,
+        windowKey,
+        pendingEventCount: pending?.length || 0,
+        lastDiscoveryAt: lastDiscoveryAt ?? null,
+        discoveryIntervalMs: MONITOR_DISCOVERY_INTERVAL_MS,
+        participantIntervalMs: MONITOR_POLL_INTERVAL_MS,
+      });
+    }
+
+    if (request.method !== "POST") {
+      return jsonResponse({ error: "Method not allowed" }, { status: 405 });
+    }
+
+    if (url.pathname === "/reset-fast") {
+      await this.state.storage.delete(MONITOR_LAST_DISCOVERY_KEY);
+      await this.state.storage.deleteAlarm();
+    }
+
+    const schedule = await getSchedule(this.env);
+    const windowKey = monitoringWindowKey(schedule);
+    if (!windowKey) {
+      await this.state.storage.deleteAlarm();
+      return jsonResponse({ ok: true, active: false, mode: "idle" });
+    }
+
+    const [alarmAt, pending] = await Promise.all([
+      this.state.storage.getAlarm(),
+      this.state.storage.get<PendingMonitorEvent[]>(MONITOR_PENDING_EVENTS_KEY),
+    ]);
+    if (alarmAt === null) {
+      await this.state.storage.setAlarm(Date.now() + 100);
+    }
+    return jsonResponse({
+      ok: true,
+      active: true,
+      mode: pending?.length ? "10s" : "minute",
+      alarmAt: alarmAt ?? Date.now() + 100,
+    });
+  }
+
+  async alarm(): Promise<void> {
+    const alarmStartedAt = Date.now();
+    const schedule = await getSchedule(this.env);
+    const windowKey = monitoringWindowKey(schedule, new Date(alarmStartedAt));
+    if (!windowKey) return;
+
+    let pending = await this.state.storage.get<PendingMonitorEvent[]>(MONITOR_PENDING_EVENTS_KEY) || [];
+    let lastDiscoveryAt = await this.state.storage.get<number>(MONITOR_LAST_DISCOVERY_KEY);
+    const discover = lastDiscoveryAt === undefined ||
+      alarmStartedAt - lastDiscoveryAt >= MONITOR_DISCOVERY_INTERVAL_MS;
+    if (discover) {
+      lastDiscoveryAt = alarmStartedAt;
+      await this.state.storage.put(MONITOR_LAST_DISCOVERY_KEY, lastDiscoveryAt);
+    }
+    const minuteBucket = Math.floor(alarmStartedAt / 60_000);
+    const previousRoutineLogMinute = await this.state.storage.get<number>(
+      MONITOR_ROUTINE_LOG_MINUTE_KEY,
+    );
+    const persistRoutineLog = previousRoutineLogMinute !== minuteBucket;
+    if (persistRoutineLog) {
+      await this.state.storage.put(MONITOR_ROUTINE_LOG_MINUTE_KEY, minuteBucket);
+    }
+
+    try {
+      const outcome = await executeMonitorCheck(this.env, this.state, {
+        trigger: discover ? "discovery-minute" : "alarm-10s",
+        scheduledTime: alarmStartedAt,
+        persistRoutineLog,
+        discover,
+        pendingEvents: pending,
+        copySeeds: await this.state.storage.get<CopySeedsByGroup>(MONITOR_COPY_SEEDS_KEY) || {},
+      });
+      pending = outcome.pendingEvents;
+      await this.state.storage.put(MONITOR_PENDING_EVENTS_KEY, pending);
+      await this.state.storage.put(MONITOR_COPY_SEEDS_KEY, outcome.copySeeds);
+    } catch (error) {
+      const runId = `alarm-${alarmStartedAt}-${crypto.randomUUID().slice(0, 8)}`;
+      const log = createOperationalLogger(this.env, this.state, {
+        runId,
+        trigger: discover ? "discovery-minute" : "alarm-10s",
+      });
+      log("monitor_check_failed", {
+        intervalMs: discover ? MONITOR_DISCOVERY_INTERVAL_MS : MONITOR_POLL_INTERVAL_MS,
+        durationMs: Date.now() - alarmStartedAt,
+        error: error instanceof Error ? error.message : String(error),
+      }, "error");
+      console.error("Racket monitor alarm failed:", error);
+    }
+
+    const discoveryAlarmAt = Math.max(Date.now() + 100,
+      (lastDiscoveryAt ?? alarmStartedAt) + MONITOR_DISCOVERY_INTERVAL_MS);
+    await this.state.storage.setAlarm(pending.length
+      ? Math.min(nextMonitorAlarmAt(alarmStartedAt), discoveryAlarmAt)
+      : discoveryAlarmAt);
+  }
+}
+
+async function kickMonitorScheduler(env: Env): Promise<void> {
+  const id = env.MONITOR_SCHEDULER.idFromName(MONITOR_SCHEDULER_NAME);
+  const response = await env.MONITOR_SCHEDULER.get(id).fetch(
+    "https://monitor-scheduler.internal/start",
+    { method: "POST" },
+  );
+  if (!response.ok) {
+    throw new Error(`Monitor scheduler failed (${response.status}): ${await response.text()}`);
+  }
+}
+
+async function getMonitorSchedulerState(env: Env) {
+  const id = env.MONITOR_SCHEDULER.idFromName(MONITOR_SCHEDULER_NAME);
+  const response = await env.MONITOR_SCHEDULER.get(id).fetch("https://monitor-scheduler.internal/");
+  if (!response.ok) throw new Error(`Monitor scheduler status failed (${response.status}).`);
+  return response.json<{
+    active: boolean;
+    mode: string;
+    pendingEventCount: number;
+    lastDiscoveryAt: number | null;
+    discoveryIntervalMs: number;
+    participantIntervalMs: number;
+    alarmAt: number | null;
+  }>();
+}
+
+async function resetMonitorFastPolling(env: Env): Promise<void> {
+  const id = env.MONITOR_SCHEDULER.idFromName(MONITOR_SCHEDULER_NAME);
+  const response = await env.MONITOR_SCHEDULER.get(id).fetch(
+    "https://monitor-scheduler.internal/reset-fast",
+    { method: "POST" },
+  );
+  if (!response.ok) {
+    throw new Error(`Monitor scheduler reset failed (${response.status}): ${await response.text()}`);
   }
 }
 
@@ -2840,14 +4566,21 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 }
 
 export default {
-  async fetch(request, env): Promise<Response> {
+  async fetch(request, env, ctx): Promise<Response> {
     const url = new URL(request.url);
+    const runId = `http-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+    const log = createOperationalLogger(env, ctx, {
+      runId,
+      trigger: url.pathname,
+    });
 
     if (url.pathname === "/telegram") {
       return handleTelegramWebhook(request, env);
     }
 
     if (url.pathname === "/check") {
+      const startedAt = Date.now();
+      log("manual_group_check_started");
       const groups = await checkMonitoredGroupEvents(env);
       const events = groups.flatMap((result) =>
         result.events.map((event) => ({
@@ -2872,7 +4605,34 @@ export default {
           : "No enabled monitored groups configured.",
       };
       console.log("Manual Racket event check:", JSON.stringify(result));
+      log("manual_group_check_finished", {
+        groupCount: result.groupCount,
+        failedGroupCount: result.failedGroupCount,
+        eventCount: events.length,
+        durationMs: Date.now() - startedAt,
+      }, result.failedGroupCount ? "warn" : "info");
       return jsonResponse(result);
+    }
+
+    if (url.pathname === "/logs") {
+      const unauthorizedResponse = requireJoinSecret(request, env);
+      if (unauthorizedResponse) return unauthorizedResponse;
+      if (request.method !== "GET") {
+        return jsonResponse(
+          { ok: false, error: "Method not allowed" },
+          { status: 405 },
+        );
+      }
+      const limit = Math.min(
+        1000,
+        Math.max(1, Number(url.searchParams.get("limit")) || 500),
+      );
+      const requestedView = url.searchParams.get("view");
+      const view: OperationLogView = ["join", "problems", "events", "all"].includes(
+        requestedView || "",
+      ) ? requestedView as OperationLogView : "join";
+      const id = env.OPERATION_LOGS.idFromName("global");
+      return new OperationLogStoreClient(env.OPERATION_LOGS.get(id)).read(limit, view);
     }
 
     if (url.pathname === "/status") {
@@ -2888,9 +4648,9 @@ export default {
       }
 
       try {
-        return jsonResponse(await getApplicationStatus(env));
+        return jsonResponse(await getApplicationStatus(env, log));
       } catch (error) {
-        operationalLog(
+        log(
           "status_snapshot_failed",
           { error: error instanceof Error ? error.message : String(error) },
           "error",
@@ -2979,15 +4739,38 @@ export default {
           submittedGroups === undefined
             ? savedGroups
             : normalizeMonitoredGroups(submittedGroups);
+        const doublesSettingsError = validateDoublesTeamSettings(groups, people);
+        if (doublesSettingsError) {
+          return jsonResponse(
+            { ok: false, error: doublesSettingsError },
+            { status: 400 },
+          );
+        }
 
         await Promise.all([
           saveRoster(env, people),
           saveSchedule(env, schedule),
           saveMonitoredGroups(env, groups),
         ]);
+        ctx.waitUntil(
+          kickMonitorScheduler(env).catch((error) => {
+            console.error("Could not refresh monitor scheduler after settings save:", error);
+          }),
+        );
         console.log(
           `Settings saved: ${people.length} people; ${groups.filter((group) => group.enabled).length}/${groups.length} groups enabled; schedule days: ${JSON.stringify(schedule.days)}.`,
         );
+        log("settings_saved", {
+          playerCount: people.length,
+          enabledPlayerCount: people.filter((person) => person.enabled).length,
+          groupCount: groups.length,
+          enabledGroupCount: groups.filter((group) => group.enabled).length,
+          scheduleDays: Object.entries(schedule.days)
+            .filter(([, enabled]) => enabled)
+            .map(([day]) => day),
+          startTime: schedule.startTime,
+          endTime: schedule.endTime,
+        });
         return jsonResponse({
           ok: true,
           count: people.length,
@@ -3018,6 +4801,11 @@ export default {
       const schedule = await getSchedule(env);
       delete schedule.pausedUntil;
       await saveSchedule(env, schedule);
+      ctx.waitUntil(
+        kickMonitorScheduler(env).catch((error) => {
+          console.error("Could not restart monitor scheduler after resume:", error);
+        }),
+      );
       console.log("Monitoring pause removed.");
       return jsonResponse({ ok: true, schedule });
     }
@@ -3040,18 +4828,23 @@ export default {
         );
       }
 
-      const eventId = await env.MONITOR_STATE.get(`${ACTIVE_JOIN_EVENT_KEY}:${groupId}`);
-      if (!eventId) {
+      const eventIds = await getActiveJoinEventIds(env, groupId);
+      if (!eventIds.length) {
         return jsonResponse(
           { ok: false, error: "No active event state exists for this group yet." },
           { status: 404 },
         );
       }
 
-      const coordinatorId = env.JOIN_COORDINATOR.idFromName(eventId);
-      const coordinator = new JoinCoordinatorClient(env.JOIN_COORDINATOR.get(coordinatorId));
       try {
-        await coordinator.reset();
+        await Promise.all(eventIds.map((eventId) => {
+          const coordinatorId = env.JOIN_COORDINATOR.idFromName(eventId);
+          const coordinator = new JoinCoordinatorClient(
+            env.JOIN_COORDINATOR.get(coordinatorId),
+          );
+          return coordinator.reset();
+        }));
+        await resetMonitorFastPolling(env);
       } catch (error) {
         return jsonResponse(
           {
@@ -3062,8 +4855,13 @@ export default {
         );
       }
 
-      console.log(`Join state reset manually for group ${groupId}, event ${eventId}.`);
-      return jsonResponse({ ok: true, groupId, eventId });
+      console.log(`Join state reset manually for group ${groupId}, events ${eventIds.join(", ")}.`);
+      return jsonResponse({
+        ok: true,
+        groupId,
+        eventId: eventIds[0],
+        eventIds,
+      });
     }
 
     if (url.pathname === "/join-state") {
@@ -3116,6 +4914,10 @@ export default {
       const targetGroupUrl = isTest ? TEST_GROUP_URL : groupUrl(targetGroupId);
 
       try {
+        log("manual_join_started", {
+          groupId: targetGroupId,
+          test: isTest,
+        });
         // Manual runs must reconcile with Racket every time. In particular,
         // test organizers can remove players while keeping the same event id.
         const result = await joinFirstAvailableEvent(
@@ -3124,10 +4926,15 @@ export default {
           env,
           true,
           true,
+          log,
         );
         console.log(`Manual Racket join (${url.pathname}):`, JSON.stringify(result));
         return jsonResponse(result);
       } catch (error) {
+        log("manual_join_failed", {
+          groupId: targetGroupId,
+          error: error instanceof Error ? error.message : String(error),
+        }, "error");
         console.error(`Manual Racket join (${url.pathname}) failed:`, error);
         return jsonResponse(
           {
@@ -3148,71 +4955,19 @@ export default {
       return;
     }
 
-    const cronStartedAt = Date.now();
-    operationalLog("cron_started", { cron: controller.cron });
-
     ctx.waitUntil(
-      (async () => {
-        try {
-          const results = await checkMonitoredGroupEvents(env);
-          if (!results.length) {
-            console.log("Scheduled check skipped: no enabled monitored groups configured.");
-            return;
-          }
-
-          for (const result of results) {
-            if (!result.ok) {
-              operationalLog(
-                "group_check_failed",
-                { groupId: result.groupId, error: result.error },
-                "error",
-              );
-              console.error(
-                `Racket event check failed for group ${result.groupId}: ${result.error || "unknown error"}`,
-              );
-              continue;
-            }
-            operationalLog("group_check_finished", {
-              groupId: result.groupId,
-              hasEvents: result.hasEvents,
-              eventCount: result.events.length,
-              durationMs: Date.now() - cronStartedAt,
-            });
-            console.log(
-              result.hasEvents ? "Racket events found:" : "No Racket events found:",
-              JSON.stringify(result),
-            );
-            await notifyIfEventsAppeared(env, result);
-
-            if (result.hasEvents) {
-              await autoJoinIfEventAppeared(
-                env,
-                result.groupId,
-                result.groupUrl,
-                result.events,
-              );
-            }
-          }
-          operationalLog("cron_finished", {
-            cron: controller.cron,
-            groupCount: results.length,
-            durationMs: Date.now() - cronStartedAt,
-          });
-        } catch (error) {
-          operationalLog(
-            "cron_failed",
-            {
-              cron: controller.cron,
-              durationMs: Date.now() - cronStartedAt,
-              error: error instanceof Error ? error.message : String(error),
-            },
-            "error",
-          );
-          console.error("Racket event check failed:", error);
-        }
-      })(),
+      kickMonitorScheduler(env).catch((error) => {
+        const runId = `cron-${controller.scheduledTime}-${crypto.randomUUID().slice(0, 8)}`;
+        const log = createOperationalLogger(env, ctx, { runId, trigger: "cron" });
+        log("monitor_scheduler_kick_failed", {
+          cron: controller.cron,
+          scheduledTime: controller.scheduledTime,
+          error: error instanceof Error ? error.message : String(error),
+        }, "error");
+        console.error("Could not start monitor scheduler:", error);
+      }),
     );
 
-    console.log(`Scheduled check accepted for cron ${controller.cron}`);
+    console.log(`Monitor scheduler accepted cron ${controller.cron}`);
   },
 } satisfies ExportedHandler<Env>;

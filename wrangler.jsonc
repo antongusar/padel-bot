@@ -19,6 +19,14 @@
       {
         "name": "JOIN_COORDINATOR",
         "class_name": "JoinCoordinator"
+      },
+      {
+        "name": "OPERATION_LOGS",
+        "class_name": "OperationLogStore"
+      },
+      {
+        "name": "MONITOR_SCHEDULER",
+        "class_name": "MonitorScheduler"
       }
     ]
   },
@@ -26,6 +34,14 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["JoinCoordinator"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["OperationLogStore"]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": ["MonitorScheduler"]
     }
   ],
   "alias": {
@@ -57,6 +73,14 @@
           {
             "name": "JOIN_COORDINATOR",
             "class_name": "JoinCoordinator"
+          },
+          {
+            "name": "OPERATION_LOGS",
+            "class_name": "OperationLogStore"
+          },
+          {
+            "name": "MONITOR_SCHEDULER",
+            "class_name": "MonitorScheduler"
           }
         ]
       },
@@ -64,6 +88,14 @@
         {
           "tag": "v1",
           "new_sqlite_classes": ["JoinCoordinator"]
+        },
+        {
+          "tag": "v2",
+          "new_sqlite_classes": ["OperationLogStore"]
+        },
+        {
+          "tag": "v3",
+          "new_sqlite_classes": ["MonitorScheduler"]
         }
       ],
       "triggers": {

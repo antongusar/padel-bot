@@ -1,8 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildApiJoinPatch,
+  buildApiTeamJoinPatch,
+  joinEventViaApi,
+  joinTeamEventViaApi,
+  type ApiJoinAttemptTelemetry,
   type FirestoreDocument,
 } from "../src/racket-api-join";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 function product(options: {
   users?: string[];
@@ -10,6 +18,8 @@ function product(options: {
   invitations?: string[];
   slots?: number;
   club?: string;
+  teamSignup?: boolean;
+  fixedTeams?: boolean;
 } = {}): FirestoreDocument {
   const users = Object.fromEntries(
     (options.users || []).map((id) => [
@@ -35,6 +45,8 @@ function product(options: {
     fields: {
       slots: { integerValue: String(options.slots ?? 8) },
       club: { stringValue: options.club || "" },
+      teamSignup: { booleanValue: options.teamSignup === true },
+      fixedTeams: { booleanValue: options.fixedTeams === true },
       users: { mapValue: { fields: users } },
       reserves: array(options.reserves || []),
       invitations: array(options.invitations || []),
@@ -126,6 +138,65 @@ describe("direct Racket API join patch", () => {
     ).toEqual({ alreadyJoined: "registered" });
   });
 
+  it("builds one fixed-team patch with a shared join date", () => {
+    const result = buildApiTeamJoinPatch(
+      product({ teamSignup: true, fixedTeams: true }),
+      "anton",
+      "partner",
+      "2026-09-07 08:22:59",
+    );
+    if (!("fields" in result)) throw new Error("Expected team patch");
+
+    expect(result.status).toBe("registered");
+    expect(result.fieldPaths).toEqual(expect.arrayContaining([
+      "users.anton",
+      "users.partner",
+    ]));
+    const users = result.fields.users?.mapValue?.fields || {};
+    expect(
+      users.anton?.mapValue?.fields?.registration?.mapValue?.fields
+        ?.signupNode?.mapValue?.fields?.joinDate?.stringValue,
+    ).toBe("2026-09-07 08:22:59");
+    expect(
+      users.partner?.mapValue?.fields?.registration?.mapValue?.fields
+        ?.signupNode?.mapValue?.fields?.joinDate?.stringValue,
+    ).toBe("2026-09-07 08:22:59");
+  });
+
+  it("creates a temporary partner before joining a placeholder team", async () => {
+    const attempts: ApiJoinAttemptTelemetry[] = [];
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(product({
+        teamSignup: true,
+        fixedTeams: true,
+      })))
+      .mockResolvedValueOnce(Response.json({ updateTime: "profile-created" }))
+      .mockResolvedValueOnce(Response.json({
+        ...product({ users: ["anton"] }),
+        updateTime: "2026-09-07T08:23:00Z",
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await joinTeamEventViaApi(
+      "event",
+      { idToken: "token", racketUserId: "anton" },
+      null,
+      "2026-09-07 08:22:59",
+      (attempt) => attempts.push(attempt),
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      status: "registered",
+      partnerUserId: expect.stringMatching(/^000T/),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(attempts.map((attempt) => attempt.outcome)).toEqual([
+      "placeholder_created",
+      "write_succeeded",
+    ]);
+  });
+
   it("uses the browser fallback for club registrations", () => {
     expect(
       buildApiJoinPatch(
@@ -134,5 +205,61 @@ describe("direct Racket API join patch", () => {
         "2026-07-27 12:34:56",
       ),
     ).toMatchObject({ unsupported: expect.stringContaining("browser") });
+  });
+
+  it("reports Firestore read and write status for a successful join", async () => {
+    const attempts: ApiJoinAttemptTelemetry[] = [];
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json(product()))
+      .mockResolvedValueOnce(Response.json({
+        ...product({ users: ["anton"] }),
+        updateTime: "2026-07-27T10:00:01Z",
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await joinEventViaApi(
+      "event",
+      { idToken: "token", racketUserId: "anton" },
+      "2026-07-27 12:34:56",
+      (attempt) => attempts.push(attempt),
+    );
+
+    expect(result).toMatchObject({ ok: true, status: "registered" });
+    expect(attempts).toEqual([
+      expect.objectContaining({
+        attempt: 1,
+        outcome: "write_succeeded",
+        readStatus: 200,
+        writeStatus: 200,
+        responseUpdateTime: "2026-07-27T10:00:01Z",
+      }),
+    ]);
+  });
+
+  it("reports every optimistic-write conflict before falling back", async () => {
+    const attempts: ApiJoinAttemptTelemetry[] = [];
+    const responses = Array.from({ length: 3 }).flatMap(() => [
+      Response.json(product()),
+      new Response("conflict", { status: 412 }),
+    ]);
+    const fetchMock = vi.fn();
+    responses.forEach((response) => fetchMock.mockResolvedValueOnce(response));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await joinEventViaApi(
+      "event",
+      { idToken: "token", racketUserId: "anton" },
+      "2026-07-27 12:34:56",
+      (attempt) => attempts.push(attempt),
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: "The event changed during all API join attempts.",
+    });
+    expect(attempts).toHaveLength(3);
+    expect(attempts.every((attempt) =>
+      attempt.outcome === "write_conflict" && attempt.writeStatus === 412
+    )).toBe(true);
   });
 });
