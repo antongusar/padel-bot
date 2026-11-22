@@ -2725,8 +2725,11 @@ function renderRosterPage(
   .live-player-table td, .live-player-table th { padding: .38rem .4rem; }
   .live-player-error { color: #a9434b; font-size: .78rem; overflow-wrap: anywhere; }
   .status-error { margin-top: 1rem; color: #a9434b; background: #fdebed; border: 1px solid #f3c8cc; border-radius: 8px; padding: .65rem .8rem; }
-  .operation-logs { margin: 0 0 2rem; padding: 0 0 1.4rem; border-bottom: 1px solid var(--border); }
-  .log-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; }
+  .operation-logs { margin: 2rem 0 0; padding: 1.2rem 0 0; border-top: 1px solid var(--border); }
+  .log-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; list-style: none; cursor: pointer; }
+  .log-head::-webkit-details-marker { display: none; }
+  .log-chevron { color: var(--muted); font-size: 1rem; transition: transform .15s; }
+  .operation-logs[open] .log-chevron { transform: rotate(90deg); }
   .log-head h2 { margin: 0; }
   .log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: .75rem; margin-top: .8rem; }
   .log-modes { display: inline-flex; min-width: 0; border: 1px solid var(--field-border); border-radius: 8px; overflow: hidden; background: #fff; }
@@ -2838,29 +2841,6 @@ function renderRosterPage(
     <div class="status-error" id="statusLoadError" hidden></div>
   </section>
 
-  <section class="operation-logs" aria-labelledby="operationLogsTitle">
-    <div class="log-head">
-      <div>
-        <h2 id="operationLogsTitle">Журнал работы</h2>
-        <div class="status-updated" id="logsUpdated">Загружаю последние шаги…</div>
-      </div>
-    </div>
-    <div class="log-toolbar">
-      <div class="log-modes" role="group" aria-label="Режим журнала">
-        <button class="log-mode is-active" type="button" data-log-view="join" aria-pressed="true">Запись игроков</button>
-        <button class="log-mode" type="button" data-log-view="problems" aria-pressed="false">Проблемы</button>
-        <button class="log-mode" type="button" data-log-view="events" aria-pressed="false">События</button>
-        <button class="log-mode" type="button" data-log-view="all" aria-pressed="false">Все проверки</button>
-      </div>
-      <div class="log-controls">
-        <label class="log-auto"><input type="checkbox" id="logsAutoRefresh" checked>Авто</label>
-        <button class="btn-refresh" id="refreshLogs" type="button">↻ Обновить</button>
-      </div>
-    </div>
-    <div class="log-list" id="operationLogs"></div>
-    <div class="log-load-error" id="logsLoadError" hidden></div>
-  </section>
-
   <div class="table-scroll">
     <table>
       <thead>
@@ -2908,6 +2888,30 @@ function renderRosterPage(
   <pre id="output" hidden></pre>
 
   <p class="hint">Пароли хранятся в Cloudflare KV в открытом виде (иначе авторизация невозможна). Страница защищена <code>JOIN_SECRET</code>. Тест использует тестовую группу <code>IenuPng40UmpsU</code> и выполняет реальную запись через API Racket.</p>
+
+  <details class="operation-logs" id="operationLogsPanel">
+    <summary class="log-head">
+      <div>
+        <h2 id="operationLogsTitle">Журнал работы</h2>
+        <div class="status-updated" id="logsUpdated">Свёрнут — нажми, чтобы открыть</div>
+      </div>
+      <span class="log-chevron" aria-hidden="true">▸</span>
+    </summary>
+    <div class="log-toolbar">
+      <div class="log-modes" role="group" aria-label="Режим журнала">
+        <button class="log-mode is-active" type="button" data-log-view="join" aria-pressed="true">Запись игроков</button>
+        <button class="log-mode" type="button" data-log-view="problems" aria-pressed="false">Проблемы</button>
+        <button class="log-mode" type="button" data-log-view="events" aria-pressed="false">События</button>
+        <button class="log-mode" type="button" data-log-view="all" aria-pressed="false">Все проверки</button>
+      </div>
+      <div class="log-controls">
+        <label class="log-auto"><input type="checkbox" id="logsAutoRefresh" checked>Авто</label>
+        <button class="btn-refresh" id="refreshLogs" type="button">↻ Обновить</button>
+      </div>
+    </div>
+    <div class="log-list" id="operationLogs"></div>
+    <div class="log-load-error" id="logsLoadError" hidden></div>
+  </details>
 </main>
 
 <script>
@@ -3520,8 +3524,12 @@ logModeEls.forEach((button) => {
     refreshOperationLogs();
   });
 });
+const operationLogsPanelEl = document.getElementById("operationLogsPanel");
+operationLogsPanelEl.addEventListener("toggle", () => {
+  if (operationLogsPanelEl.open) refreshOperationLogs();
+});
 window.setInterval(() => {
-  if (logsAutoRefreshEl.checked && document.visibilityState === "visible") {
+  if (operationLogsPanelEl.open && logsAutoRefreshEl.checked && document.visibilityState === "visible") {
     refreshOperationLogs();
   }
 }, 10000);
@@ -3904,7 +3912,6 @@ renderSchedule();
 renderGroups();
 renderPause();
 refreshApplicationStatus();
-refreshOperationLogs();
 </script>
 </body>
 </html>`;
